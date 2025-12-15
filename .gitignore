@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Taichi cache (optional)
+.taichi/
