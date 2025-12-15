@@ -1,0 +1,130 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>3D Vertex Viewer</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: -apple-system, system-ui; }
+    #hud {
+      position: absolute; top: 12px; left: 12px;
+      background: rgba(0,0,0,0.55); color: white;
+      padding: 10px 12px; border-radius: 10px; line-height: 1.25;
+      max-width: 360px;
+    }
+    #hud b { font-size: 14px; }
+  </style>
+</head>
+<body>
+<div id="hud">
+  <b>Vertices</b><br/>
+  Clicks: pinch = add vertex<br/>
+  After 2 vertices → cube generated<br/>
+  <br/>
+  <div id="dims"></div>
+  <div id="math"></div>
+</div>
+
+<script type="module">
+import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 1000);
+camera.position.set(0.2, 0.2, 0.4);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AxesHelper(0.2));
+scene.add(new THREE.GridHelper(1, 10));
+
+const light = new THREE.DirectionalLight(0xffffff, 1.0);
+light.position.set(1,2,1);
+scene.add(light);
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+let vertices = [];
+let pointsObj = null;
+let cubeObj = null;
+
+function addPoint(v) {
+  vertices.push(v);
+
+  const geom = new THREE.BufferGeometry().setFromPoints(vertices.map(p => new THREE.Vector3(p.x,p.y,p.z)));
+  const mat = new THREE.PointsMaterial({ size: 0.006 });
+  if (pointsObj) scene.remove(pointsObj);
+  pointsObj = new THREE.Points(geom, mat);
+  scene.add(pointsObj);
+
+  if (vertices.length === 2) buildCube(vertices[0], vertices[1]);
+}
+
+function buildCube(a, b) {
+  if (cubeObj) scene.remove(cubeObj);
+
+  // Axis-aligned box between two opposite corners
+  const min = { x: Math.min(a.x,b.x), y: Math.min(a.y,b.y), z: Math.min(a.z,b.z) };
+  const max = { x: Math.max(a.x,b.x), y: Math.max(a.y,b.y), z: Math.max(a.z,b.z) };
+
+  const w = max.x - min.x;
+  const h = max.y - min.y;
+  const d = max.z - min.z;
+
+  const geom = new THREE.BoxGeometry(w, h, d);
+  const mat = new THREE.MeshStandardMaterial({ transparent:true, opacity:0.25 });
+  cubeObj = new THREE.Mesh(geom, mat);
+
+  cubeObj.position.set(min.x + w/2, min.y + h/2, min.z + d/2);
+  scene.add(cubeObj);
+
+  // Dimensions + math panel (meters assumed)
+  const dims = document.getElementById("dims");
+  dims.innerHTML =
+    `<b>Dimensions</b><br/>` +
+    `w=${w.toFixed(4)} m<br/>h=${h.toFixed(4)} m<br/>d=${d.toFixed(4)} m<br/>` +
+    `V = ${(w*h*d).toFixed(6)} m³<br/>` +
+    `SA = ${ (2*(w*h + w*d + h*d)).toFixed(6) } m²<br/>` +
+    `diag = ${ Math.sqrt(w*w+h*h+d*d).toFixed(6) } m`;
+
+  const rho = 1000; // kg/m^3 (water default)
+  const m = rho * (w*h*d);
+  const Ix = (1/12) * m * (h*h + d*d);
+  const Iy = (1/12) * m * (w*w + d*d);
+  const Iz = (1/12) * m * (w*w + h*h);
+
+  const math = document.getElementById("math");
+  math.innerHTML =
+    `<br/><b>Physics + Calculus</b><br/>` +
+    `Assume density ρ=${rho} kg/m³<br/>` +
+    `m = ρ·w·h·d = ${m.toFixed(4)} kg<br/>` +
+    `I = (1/12)m[...]<br/>` +
+    `Ix=${Ix.toFixed(4)}, Iy=${Iy.toFixed(4)}, Iz=${Iz.toFixed(4)}<br/>` +
+    `V = ∫₀ʷ ∫₀ʰ ∫₀ᵈ dz dy dx = w·h·d`;
+}
+
+function animate() {
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// WebSocket to receive vertices
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === "vertex") addPoint(msg);
+};
+</script>
+</body>
+</html>
