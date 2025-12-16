@@ -1,34 +1,28 @@
-# app.py
-import os
-import sys
+# app.py (CAD HUD only — no Taichi)
 import time
 import importlib
 import cv2
-import requests
 
-from sim_taichi import ParticleSimTaichi
-from params import Params
+from hud_cad import HUDCAD
 from predictor import AlphaBetaPredictor
-from hud_lines import HUDLines
+from voice_cmd import VoiceCommands
 
-STREAM_TO_SERVER = True
-SERVER_HAND_URL = "http://127.0.0.1:8765/hand"
-WINDOW_NAME = "Hand Fluid Particles (Two Fingertips + Predict)"
+WINDOW_NAME = "2FingerInteractiveVertex - CAD HUD"
 
 # Visual toggles
 DRAW_POINTERS = True
 DRAW_ALL_LANDMARKS = False
 
-# Predictive smoothing (feels way better)
+# Predictive smoothing (feels good)
 USE_PREDICTION = True
-PRED_LEAD_SEC = 1.0 / 60.0  # predict ~1 frame ahead
+PRED_LEAD_SEC = 1.0 / 60.0
 PRED_ALPHA = 0.85
 PRED_BETA = 0.02
 PRED_ADAPTIVE = True
 
 # Pinch tuning in normalized UV space (index-tip to thumb-tip distance)
-PINCH_OPEN_DIST = 0.12  # bigger => easier to reach pinch=1
-PINCH_ACTIVE_THRESH = 0.10  # below this, you can treat it as "not pinching"
+PINCH_OPEN_DIST = 0.12
+PINCH_ACTIVE_THRESH = 0.10
 
 
 def open_camera(max_index=6):
@@ -41,17 +35,6 @@ def open_camera(max_index=6):
                 return cap
         cap.release()
     raise RuntimeError(f"❌ No working camera found (0–{max_index-1}).")
-
-
-def init_taichi():
-    import taichi as ti
-    try:
-        ti.init(arch=ti.cuda, default_fp=ti.f32)
-        print("✅ Taichi using CUDA")
-    except Exception as e:
-        ti.init(arch=ti.cpu, default_fp=ti.f32)
-        print(f"ℹ️ Taichi using CPU (CUDA init failed: {e})")
-    return ti
 
 
 def _pick_hand_tracker():
@@ -100,114 +83,131 @@ def _as_hands_list(hand_result):
         return []
     if isinstance(hand_result, dict) and isinstance(hand_result.get("hands"), list):
         return hand_result["hands"]
-    if isinstance(hand_result, dict):
-        return [hand_result]
+    if isinstance(hand_result, (list, tuple)):
+        return list(hand_result)
     return []
 
 
-def _get_landmarks_px(hand_dict):
-    for k in ("landmarks_px", "lm_px", "landmarks"):
-        v = hand_dict.get(k)
-        if isinstance(v, list) and len(v) >= 9:
-            return v
+def _get_landmarks_px(hand):
+    """
+    Your hands.py spec says it returns:
+      {"hands": [{"landmarks_px": [(x,y)*21]}, ...]}
+    But we also accept older shapes for safety.
+    """
+    if hand is None:
+        return None
+    if isinstance(hand, dict):
+        for k in ("landmarks_px", "landmarks", "lm", "lms"):
+            if k in hand:
+                return hand[k]
+        return None
+
+    # object style
+    for attr in ("landmarks_px", "landmarks", "lm", "lms"):
+        if hasattr(hand, attr):
+            return getattr(hand, attr)
+
+    if isinstance(hand, (list, tuple)) and len(hand) >= 10:
+        return hand
+
     return None
 
 
-def _tip_uv(lms_px, idx, w, h):
-    x, y = lms_px[idx]
-    return (x / w, y / h), (int(x), int(y))
+def _tip_uv(lms, idx, w, h):
+    x, y = lms[idx][0], lms[idx][1]
+    # if normalized
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        uv = (float(x), float(y))
+        px = (int(x * w), int(y * h))
+        return uv, px
+    # assume pixels
+    px = (int(x), int(y))
+    uv = (float(px[0]) / float(w), float(px[1]) / float(h))
+    return uv, px
 
 
-def _pinch_from_lms(lms_px, w, h):
-    idx_uv, _ = _tip_uv(lms_px, 8, w, h)
-    thb_uv, _ = _tip_uv(lms_px, 4, w, h)
+def _pinch_from_lms(lms, w, h):
+    idx_uv, _ = _tip_uv(lms, 8, w, h)   # index tip
+    thb_uv, _ = _tip_uv(lms, 4, w, h)   # thumb tip
+
     dx = idx_uv[0] - thb_uv[0]
     dy = idx_uv[1] - thb_uv[1]
-    dist = (dx * dx + dy * dy) ** 0.5
-    pinch = 1.0 - min(dist / PINCH_OPEN_DIST, 1.0)
-    return float(pinch)
+    d = (dx * dx + dy * dy) ** 0.5
+
+    pinch = 1.0 - min(1.0, max(0.0, d / float(PINCH_OPEN_DIST)))
+    if d > PINCH_ACTIVE_THRESH:
+        pinch *= 0.85
+    return float(max(0.0, min(1.0, pinch)))
 
 
 def main():
-    init_taichi()
-    print("RUNNING app.py", "PID:", os.getpid(), "PY:", sys.executable)
-
-    params = Params()
-
     cap = open_camera()
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    hand_tracker = _pick_hand_tracker()
 
-    tracker = _pick_hand_tracker()
-    sim = ParticleSimTaichi(params=params)
-
-    # Tony HUD interface layer (2-finger line tool)
-    hud = HUDLines(
-        grid_w=getattr(params, "grid_w", 240),
-        grid_h=getattr(params, "grid_h", 135),
-    )
-
+    hud = HUDCAD()
+    voice = None
+    try:
+        voice = VoiceCommands()
+        voice.start()
+        print("✅ Voice commands ON")
+    except Exception as e:
+        print(f"⚠️ Voice commands OFF ({e})")
+        
     pred = [
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
     ]
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    session = requests.Session()
-
     prev_time = time.time()
     fps_smooth = 0.0
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            continue
+            print("❌ Frame grab failed")
+            break
 
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
-
         now = time.time()
-        dt = max(1e-4, min(now - prev_time, 1 / 20))
+        dt = max(1e-6, now - prev_time)
         prev_time = now
 
         fps = 1.0 / dt
         fps_smooth = 0.9 * fps_smooth + 0.1 * fps if fps_smooth > 0 else fps
 
-        hand_result = tracker.process(frame)
-        hands = _as_hands_list(hand_result)
+        # ---- hand tracking ----
+        res = hand_tracker.process(frame)
+        hands = _as_hands_list(res)
 
         active = [0, 0]
         pinch_val = [0.0, 0.0]
         pos_uv_raw = [(0.0, 0.0), (0.0, 0.0)]
 
-        # Pointer selection
         if len(hands) >= 2:
             for hid in range(2):
                 lms = _get_landmarks_px(hands[hid])
                 if lms is None:
                     continue
-                idx_uv, idx_px = _tip_uv(lms, 8, w, h)
-                thb_uv, thb_px = _tip_uv(lms, 4, w, h)
 
+                idx_uv, idx_px = _tip_uv(lms, 8, w, h)
                 active[hid] = 1
                 pos_uv_raw[hid] = idx_uv
                 pinch_val[hid] = _pinch_from_lms(lms, w, h)
 
                 if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 7, (255, 255, 0), -1)
-                    cv2.circle(frame, thb_px, 7, (255, 0, 255), -1)
+                    cv2.circle(frame, idx_px, 7, (235, 245, 255), -1, lineType=cv2.LINE_AA)
 
                 if DRAW_ALL_LANDMARKS:
-                    for (lx, ly) in lms:
-                        cv2.circle(frame, (int(lx), int(ly)), 2, (0, 255, 0), -1)
+                    for (lx, ly, *rest) in lms:
+                        cv2.circle(frame, (int(lx), int(ly)), 2, (160, 220, 255), -1)
 
         elif len(hands) == 1:
             lms = _get_landmarks_px(hands[0])
             if lms is not None:
                 idx_uv, idx_px = _tip_uv(lms, 8, w, h)
                 thb_uv, thb_px = _tip_uv(lms, 4, w, h)
-
                 pinch = _pinch_from_lms(lms, w, h)
 
                 active[0] = 1
@@ -218,17 +218,12 @@ def main():
                 pinch_val[1] = pinch
 
                 if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 8, (255, 255, 0), -1)
-                    cv2.circle(frame, thb_px, 8, (255, 0, 255), -1)
+                    cv2.circle(frame, idx_px, 7, (235, 245, 255), -1, lineType=cv2.LINE_AA)
+                    cv2.circle(frame, thb_px, 7, (180, 240, 255), -1, lineType=cv2.LINE_AA)
 
-                if DRAW_ALL_LANDMARKS:
-                    for (lx, ly) in lms:
-                        cv2.circle(frame, (int(lx), int(ly)), 2, (0, 255, 0), -1)
-
-        # Predict + send to sim
+        # ---- prediction (the “after this feels good” part) ----
         pos_uv_send = [(0.0, 0.0), (0.0, 0.0)]
         vel_uv_send = [(0.0, 0.0), (0.0, 0.0)]
-
         for hid in range(2):
             if active[hid]:
                 if USE_PREDICTION:
@@ -240,75 +235,29 @@ def main():
                     vel_uv_send[hid] = (0.0, 0.0)
             else:
                 pred[hid].reset()
-                pos_uv_send[hid] = (0.0, 0.0)
-                vel_uv_send[hid] = (0.0, 0.0)
 
-            sim.set_hand_input(
-                pos_uv_send[hid],
-                vel_uv_send[hid],
-                pinch_val[hid],
-                hand_present=bool(active[hid]),
-                hand_id=hid,
-            )
-
-        if DRAW_POINTERS and USE_PREDICTION:
-            for hid in range(2):
-                if active[hid]:
-                    px = int(pos_uv_send[hid][0] * w)
-                    py = int(pos_uv_send[hid][1] * h)
-                    cv2.circle(frame, (px, py), 6, (255, 0, 0), -1)
-
-        # ---- step + render sim ----
-        sim.step(dt)
-        sim.render_on_frame(frame)
-
-        # ---- HUD interface update + render ----
-        hud.update(pos_uv_send, pinch_val, active, w, h)
+        # HUD update + render (dt supported now)
+        hud.update(pos_uv_send, vel_uv_send, pinch_val, active, w, h, dt=dt)
         hud.render(frame)
-
-        # ---- Optional stream ----
-        if STREAM_TO_SERVER:
-            payload = {
-                "type": "hand",
-                "t": now,
-                "pointers": [
-                    {
-                        "id": 0,
-                        "active": bool(active[0]),
-                        "pos_uv": [float(pos_uv_send[0][0]), float(pos_uv_send[0][1])],
-                        "vel_uv": [float(vel_uv_send[0][0]), float(vel_uv_send[0][1])],
-                        "pinch": float(pinch_val[0]),
-                    },
-                    {
-                        "id": 1,
-                        "active": bool(active[1]),
-                        "pos_uv": [float(pos_uv_send[1][0]), float(pos_uv_send[1][1])],
-                        "vel_uv": [float(vel_uv_send[1][0]), float(vel_uv_send[1][1])],
-                        "pinch": float(pinch_val[1]),
-                    },
-                ],
-            }
-            try:
-                session.post(SERVER_HAND_URL, json=payload, timeout=0.05)
-            except Exception:
-                pass
 
         cv2.putText(
             frame,
             f"FPS: {fps_smooth:.1f}",
-            (20, 30),
+            (20, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (255, 255, 255),
+            (235, 245, 255),
             2,
+            cv2.LINE_AA,
         )
+        if voice:
+            for phrase in voice.poll():
+                hud.apply_voice(phrase)
 
         cv2.imshow(WINDOW_NAME, frame)
         key = cv2.waitKey(1) & 0xFF
 
-        # forward keys to BOTH systems
         hud.handle_key(key)
-        sim.handle_key(key)
 
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
