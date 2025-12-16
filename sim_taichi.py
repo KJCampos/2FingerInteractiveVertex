@@ -15,68 +15,86 @@ class ParticleSimTaichi:
     """
     Stable incompressible 2D fluid (grid-based) driven by up to 2 fingertip pointers.
 
-    Keeps your API:
+    API kept:
       sim = ParticleSimTaichi(params=params)
       sim.set_hand_input(pos_uv, vel_uv, pinch, hand_present=True/False, hand_id=0/1)
       sim.step(dt)
-      sim.render_on_frame(frame)   # modifies frame in-place and returns it
+      sim.render_on_frame(frame)  # modifies frame in-place and returns it
+      sim.handle_key(key)         # toggles render + tools
 
-    Extras:
-      sim.handle_key(key)          # toggle render modes + clear/reset
+    Tools:
+      - DRAW walls (thin strokes): pinch >= draw_threshold
+      - EXTRUDE: (tool mode) pinch (both fingers) + spread/squeeze => pushes flow like “lifting/warping”
     """
+
+    TOOL_DRAW = 0
+    TOOL_EXTRUDE = 1
 
     def __init__(self, params):
         self.params = params
 
-        # ---------------- Grid resolution ----------------
+        # ---------- Grid ----------
         self.W = int(_pget(params, "grid_w", 240))
         self.H = int(_pget(params, "grid_h", 135))
 
-        # ---------------- Core sim params ----------------
+        # ---------- Time ----------
         self.dt_max = float(_pget(params, "dt_max", 1.0 / 30.0))
         self.advect_strength = float(_pget(params, "advect_strength", 1.0))
 
-        # viscosity / diffusion
-        self.viscosity = float(_pget(params, "viscosity", 0.0025))
-        self.diffuse_iters = int(_pget(params, "diffuse_iters", 12))
-        self.project_iters = int(_pget(params, "project_iters", 24))
+        # ---------- Viscosity / projection ----------
+        self.viscosity = float(_pget(params, "viscosity", 0.0020))
+        self.diffuse_iters = int(_pget(params, "diffuse_iters", 10))
+        self.project_iters = int(_pget(params, "project_iters", 22))
 
-        # dye
-        self.dye_decay = float(_pget(params, "dye_decay", 0.985))
-        self.dye_inject = float(_pget(params, "dye_inject", 1.0))
+        # ---------- Dye ----------
+        self.dye_decay = float(_pget(params, "dye_decay", 0.988))
+        self.dye_inject = float(_pget(params, "dye_inject", 0.9))
 
-        # pointer force shape (in grid cells)
+        # ---------- Input scaling (prevents insane velocities) ----------
+        self.input_vel_scale = float(_pget(params, "input_vel_scale", 0.45))
+        self.vel_limit = float(_pget(params, "vel_limit", 55.0))  # grid-cells/sec
+
+        # ---------- Pointer force shape ----------
         self.force_radius = float(_pget(params, "force_radius", 12.0))
-        self.force_sigma = float(_pget(params, "force_sigma", self.force_radius * 0.55))
+        self.force_sigma = float(_pget(params, "force_sigma", self.force_radius * 0.60))
         self.force_sigma2 = self.force_sigma * self.force_sigma
 
-        # force gains
-        self.push_gain = float(_pget(params, "push_gain", 1.25))
-        self.swirl_gain = float(_pget(params, "swirl_gain", 2.0))
-        self.pinch_gain = float(_pget(params, "pinch_gain", 1.15))
+        # ---------- Force gains (tuned softer / less explosive) ----------
+        self.push_gain = float(_pget(params, "push_gain", 0.65))
+        self.swirl_gain = float(_pget(params, "swirl_gain", 1.10))
+        self.pinch_gain = float(_pget(params, "pinch_gain", 0.95))
 
-        # pair grab/stretch
-        self.pair_grab_gain = float(_pget(params, "pair_grab_gain", 1.35))
-        self.pair_stretch_gain = float(_pget(params, "pair_stretch_gain", 0.80))
+        # ---------- Two-pointer grab/stretch ----------
+        self.pair_grab_gain = float(_pget(params, "pair_grab_gain", 1.10))
+        self.pair_stretch_gain = float(_pget(params, "pair_stretch_gain", 0.60))
         self.pair_radius = float(_pget(params, "pair_radius", 10.0))
-        self.pair_sigma2 = (self.pair_radius * 0.8) ** 2
+        self.pair_sigma2 = (self.pair_radius * 0.85) ** 2
 
-        # ---------------- “Shape drawing” via obstacles ----------------
-        # Your app pinch is 0..1 where 1 = closed (you already do that)
+        # ---------- Wall drawing (thin strokes) ----------
+        # pinch is 0..1 where 1=closed
         self.draw_obstacle_when_pinch = float(_pget(params, "draw_obstacle_when_pinch", 0.80))
-        self.obstacle_radius = float(_pget(params, "obstacle_radius", 6.0))  # in grid cells
+        self.obstacle_thickness = float(_pget(params, "obstacle_thickness", 2.0))  # grid cells
 
-        # ---------------- Rendering + modes ----------------
-        # 0 = dye, 1 = vorticity, 2 = pressure, 3 = speed
+        # ---------- Extrude tool ----------
+        self.tool_mode = int(_pget(params, "tool_mode", self.TOOL_DRAW))
+        self.extrude_pinch_min = float(_pget(params, "extrude_pinch_min", 0.55))  # both fingers pinched
+        self.extrude_gain = float(_pget(params, "extrude_gain", 5.0))
+        self.extrude_dye = float(_pget(params, "extrude_dye", 2.5))
+
+        # ---------- Rendering ----------
+        # 0 dye, 1 vorticity, 2 pressure, 3 speed
         self.render_mode = int(_pget(params, "render_mode", 0))
 
-        self.render_blur_ksize = int(_pget(params, "render_blur_ksize", 17))
+        self.render_blur_ksize = int(_pget(params, "render_blur_ksize", 21))
         if self.render_blur_ksize % 2 == 0:
             self.render_blur_ksize += 1
-        self.render_alpha = float(_pget(params, "render_alpha", 0.65))
-        self.colormap = int(_pget(params, "colormap", cv2.COLORMAP_TURBO))
 
-        # ---------------- Taichi fields ----------------
+        # softer look
+        self.render_alpha = float(_pget(params, "render_alpha", 0.42))
+        self.colormap = int(_pget(params, "colormap", cv2.COLORMAP_VIRIDIS))
+        self.cmap_saturation = float(_pget(params, "cmap_saturation", 0.60))  # 1.0 = full color, lower = softer
+
+        # ---------- Fields ----------
         self.vel = ti.Vector.field(2, dtype=ti.f32, shape=(self.W, self.H))
         self.vel0 = ti.Vector.field(2, dtype=ti.f32, shape=(self.W, self.H))
         self.vel1 = ti.Vector.field(2, dtype=ti.f32, shape=(self.W, self.H))
@@ -99,30 +117,63 @@ class ParticleSimTaichi:
         # Hand inputs (2 pointers)
         self.hand_pos_uv = ti.Vector.field(2, dtype=ti.f32, shape=(2,))
         self.hand_vel_uv = ti.Vector.field(2, dtype=ti.f32, shape=(2,))
-        self.hand_pinch = ti.field(dtype=ti.f32, shape=(2,))   # 0..1 (1 closed)
+        self.hand_pinch = ti.field(dtype=ti.f32, shape=(2,))
         self.hand_present = ti.field(dtype=ti.i32, shape=(2,))
+
+        # Stroke memory for thin walls (grid coords)
+        self.draw_prev = ti.Vector.field(2, dtype=ti.f32, shape=(2,))
+        self.draw_has_prev = ti.field(dtype=ti.i32, shape=(2,))
 
         self.reset()
 
-    # ========================= Public controls =========================
+    # ===================== Controls =====================
 
     def handle_key(self, key: int):
         """
-        Call this from app.py with cv2.waitKey.
         Keys:
-          0/1/2/3: render modes (dye/vorticity/pressure/speed)
-          c: clear obstacles
-          r: reset sim
+          0/1/2/3  render modes (dye/vort/press/speed)
+          T        toggle tool mode (DRAW <-> EXTRUDE)
+          [ / ]    thinner/thicker walls
+          M        cycle soft colormaps
+          C        clear obstacles
+          R        reset sim
         """
         if key is None:
             return
 
         if key in (ord('0'), ord('1'), ord('2'), ord('3')):
             self.render_mode = int(chr(key))
-        elif key in (ord('c'), ord('C')):
+            return
+
+        if key in (ord('c'), ord('C')):
             self.clear_obstacles()
-        elif key in (ord('r'), ord('R')):
+            return
+
+        if key in (ord('r'), ord('R')):
             self.reset()
+            return
+
+        if key in (ord('t'), ord('T')):
+            self.tool_mode = self.TOOL_EXTRUDE if self.tool_mode == self.TOOL_DRAW else self.TOOL_DRAW
+            return
+
+        if key == ord('['):
+            self.obstacle_thickness = max(1.0, self.obstacle_thickness - 0.5)
+            return
+
+        if key == ord(']'):
+            self.obstacle_thickness = min(8.0, self.obstacle_thickness + 0.5)
+            return
+
+        if key in (ord('m'), ord('M')):
+            # soft-ish options
+            options = [cv2.COLORMAP_VIRIDIS, cv2.COLORMAP_CIVIDIS, cv2.COLORMAP_OCEAN, cv2.COLORMAP_BONE]
+            try:
+                idx = options.index(self.colormap)
+            except ValueError:
+                idx = 0
+            self.colormap = options[(idx + 1) % len(options)]
+            return
 
     def clear_obstacles(self):
         self._clear_obstacles_kernel()
@@ -136,14 +187,13 @@ class ParticleSimTaichi:
             return
         self.hand_pos_uv[hid] = ti.Vector([float(pos_uv[0]), float(pos_uv[1])])
         self.hand_vel_uv[hid] = ti.Vector([float(vel_uv[0]), float(vel_uv[1])])
-        self.hand_pinch[hid] = float(max(0.0, min(1.0, pinch)))  # 1=closed
+        self.hand_pinch[hid] = float(max(0.0, min(1.0, pinch)))
         self.hand_present[hid] = 1 if hand_present else 0
 
     def get_positions(self) -> np.ndarray:
-        # Kept for compatibility with older codepaths.
         return np.zeros((0, 2), dtype=np.float32)
 
-    # ========================= Core sim loop =========================
+    # ===================== Sim step =====================
 
     def step(self, dt):
         dt = float(dt)
@@ -151,22 +201,25 @@ class ParticleSimTaichi:
             return
         dt = min(dt, self.dt_max)
 
-        # 1) Inject from fingers (or draw obstacles)
+        # 1) Inputs (forces OR tools)
         self._apply_inputs(dt)
         self._apply_obstacles()
+        self._clamp_velocity()
 
-        # 2) Diffuse (viscosity)
+        # 2) Viscosity
         if self.viscosity > 0.0 and self.diffuse_iters > 0:
             self._diffuse_velocity(dt)
             self._apply_obstacles()
+            self._clamp_velocity()
 
-        # 3) Project (incompressible)
+        # 3) Project incompressible
         self._project()
         self._apply_obstacles()
 
         # 4) Advect velocity
         self._advect_velocity(dt)
         self._apply_obstacles()
+        self._clamp_velocity()
 
         # 5) Project again
         self._project()
@@ -176,11 +229,11 @@ class ParticleSimTaichi:
         self._advect_dye(dt)
         self._apply_obstacles()
 
-        # 7) Dye decay + diagnostics
+        # 7) Decay + diagnostics
         self._decay_dye()
         self._compute_diagnostics()
 
-    # ========================= Rendering =========================
+    # ===================== Rendering =====================
 
     def render_on_frame(self, frame_bgr):
         if frame_bgr is None:
@@ -188,61 +241,57 @@ class ParticleSimTaichi:
 
         h, w = frame_bgr.shape[:2]
 
-        # Pick field for display
+        # Pick field
         if self.render_mode == 0:
             field = np.clip(self.dye.to_numpy().T, 0.0, 1.0)
             img = (field * 255.0).astype(np.uint8)
-
         elif self.render_mode == 1:
             field = self.vort.to_numpy().T
             m = float(np.max(np.abs(field)) + 1e-6)
-            img = np.clip(128.0 + 127.0 * (field / m), 0, 255).astype(np.uint8)
-
+            img = np.clip(128.0 + 96.0 * (field / m), 0, 255).astype(np.uint8)
         elif self.render_mode == 2:
             field = self.p.to_numpy().T
             m = float(np.max(np.abs(field)) + 1e-6)
-            img = np.clip(128.0 + 127.0 * (field / m), 0, 255).astype(np.uint8)
-
-        else:  # 3 speed
+            img = np.clip(128.0 + 96.0 * (field / m), 0, 255).astype(np.uint8)
+        else:
             field = self.speed.to_numpy().T
             m = float(np.max(field) + 1e-6)
             img = np.clip(255.0 * (field / m), 0, 255).astype(np.uint8)
 
-        # Upscale to camera resolution
         up = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        # Blur to avoid pixel noise
         up = cv2.GaussianBlur(up, (self.render_blur_ksize, self.render_blur_ksize), 0)
 
         colored = cv2.applyColorMap(up, self.colormap)
+
+        # soften saturation (blend with grayscale)
+        gray3 = cv2.cvtColor(up, cv2.COLOR_GRAY2BGR)
+        colored = cv2.addWeighted(colored, float(self.cmap_saturation), gray3, float(1.0 - self.cmap_saturation), 0)
+
         out = cv2.addWeighted(frame_bgr, 1.0, colored, float(self.render_alpha), 0.0)
 
-        # Overlay obstacle mask (white outlines)
+        # obstacle outlines
         obst = self.obst.to_numpy().T.astype(np.uint8) * 255
         obst_up = cv2.resize(obst, (w, h), interpolation=cv2.INTER_NEAREST)
-        edges = cv2.Canny(obst_up, 40, 120)
-        out[edges > 0] = (255, 255, 255)
+        edges = cv2.Canny(obst_up, 50, 140)
+        out[edges > 0] = (245, 245, 245)
 
         # HUD
-        vort_np = self.vort.to_numpy()
-        spd_np = self.speed.to_numpy()
-        div_np = self.div_abs.to_numpy()
+        vmax = float(np.max(np.abs(self.vort.to_numpy())))
+        smax = float(np.max(self.speed.to_numpy()))
+        drms = float(np.sqrt(np.mean(self.div_abs.to_numpy() ** 2)))
 
-        vmax = float(np.max(np.abs(vort_np)))
-        smax = float(np.max(spd_np))
-        drms = float(np.sqrt(np.mean(div_np * div_np)))
-
+        tool_name = "DRAW" if self.tool_mode == self.TOOL_DRAW else "EXTRUDE"
         cv2.putText(out, f"Mode {self.render_mode}: 0 Dye | 1 Vorticity | 2 Pressure | 3 Speed",
-                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(out, f"|w|max={vmax:.2f}  |u|max={smax:.2f}  div_rms={drms:.5f}",
-                    (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-        cv2.putText(out, f"Pinch >= {self.draw_obstacle_when_pinch:.2f}: DRAW SOLID WALLS  |  Keys: 0-3, C clear, R reset",
-                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 240), 2)
+        cv2.putText(out, f"Tool: {tool_name}   (T toggle)   Wall thickness: {self.obstacle_thickness:.1f}  ([ / ])",
+                    (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (240, 240, 240), 2)
+        cv2.putText(out, f"|w|max={vmax:.2f}  |u|max={smax:.2f}  div_rms={drms:.5f}   C clear  R reset  M colormap",
+                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (240, 240, 240), 2)
 
         frame_bgr[:] = out
         return frame_bgr
 
-    # ========================= Taichi helpers =========================
+    # ===================== Helpers =====================
 
     @ti.func
     def _clampf(self, x, a, b):
@@ -296,7 +345,18 @@ class ParticleSimTaichi:
         b = v01 * (1.0 - sx) + v11 * sx
         return a * (1.0 - sy) + b * sy
 
-    # ========================= Clear kernels =========================
+    @ti.func
+    def _dist2_point_segment(self, p, a, b):
+        ab = b - a
+        ap = p - a
+        denom = ab.dot(ab) + 1e-6
+        t = ap.dot(ab) / denom
+        t = self._clampf(t, 0.0, 1.0)
+        c = a + ab * t
+        d = p - c
+        return d.dot(d)
+
+    # ===================== Clear kernels =====================
 
     @ti.kernel
     def _clear_all_kernel(self):
@@ -319,50 +379,69 @@ class ParticleSimTaichi:
             self.hand_vel_uv[k] = ti.Vector([0.0, 0.0])
             self.hand_pinch[k] = 0.0
             self.hand_present[k] = 0
+            self.draw_prev[k] = ti.Vector([0.0, 0.0])
+            self.draw_has_prev[k] = 0
 
     @ti.kernel
     def _clear_obstacles_kernel(self):
         for i, j in ti.ndrange(self.W, self.H):
             self.obst[i, j] = 0
 
-    # ========================= Input forces + obstacle drawing =========================
+    # ===================== Core input kernel =====================
 
     @ti.kernel
     def _apply_inputs(self, dt: ti.f32):
+        # per-hand: either draw strokes OR inject forces
         for hid in range(2):
             if self.hand_present[hid] == 0:
+                self.draw_has_prev[hid] = 0
                 continue
 
             p_uv = self.hand_pos_uv[hid]
             v_uv = self.hand_vel_uv[hid]
-            pinch = self.hand_pinch[hid]  # 0..1 where 1=closed
+            pinch = self.hand_pinch[hid]
 
             p = self._uv_to_grid(p_uv)
-            v = ti.Vector([v_uv[0] * float(self.W), v_uv[1] * float(self.H)])
+            v = ti.Vector([v_uv[0] * float(self.W), v_uv[1] * float(self.H)]) * ti.cast(self.input_vel_scale, ti.f32)
 
             closed = self._clampf(pinch, 0.0, 1.0)
             open_amt = 1.0 - closed
 
-            # --- Pinch tool: draw SOLID walls/obstacles ---
-            if closed >= ti.cast(self.draw_obstacle_when_pinch, ti.f32):
-                rr = ti.cast(self.obstacle_radius, ti.i32)
-                cx = ti.cast(p[0], ti.i32)
-                cy = ti.cast(p[1], ti.i32)
-                x0 = ti.max(0, cx - rr)
-                x1 = ti.min(self.W - 1, cx + rr)
-                y0 = ti.max(0, cy - rr)
-                y1 = ti.min(self.H - 1, cy + rr)
+            # ---------------- Thin wall drawing (stroke capsule) ----------------
+            if self.tool_mode == self.TOOL_DRAW and closed >= ti.cast(self.draw_obstacle_when_pinch, ti.f32):
+                a = p
+                if self.draw_has_prev[hid] == 1:
+                    a = self.draw_prev[hid]
+                b = p
+
+                thick = ti.cast(self.obstacle_thickness, ti.f32)
+                thick2 = thick * thick
+
+                minx = ti.cast(ti.floor(ti.min(a[0], b[0]) - thick - 1.0), ti.i32)
+                maxx = ti.cast(ti.ceil (ti.max(a[0], b[0]) + thick + 1.0), ti.i32)
+                miny = ti.cast(ti.floor(ti.min(a[1], b[1]) - thick - 1.0), ti.i32)
+                maxy = ti.cast(ti.ceil (ti.max(a[1], b[1]) + thick + 1.0), ti.i32)
+
+                x0 = ti.max(0, minx)
+                x1 = ti.min(self.W - 1, maxx)
+                y0 = ti.max(0, miny)
+                y1 = ti.min(self.H - 1, maxy)
 
                 for i, j in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
-                    dx = ti.cast(i, ti.f32) - p[0]
-                    dy = ti.cast(j, ti.f32) - p[1]
-                    if dx * dx + dy * dy <= self.obstacle_radius * self.obstacle_radius:
+                    q = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
+                    d2 = self._dist2_point_segment(q, a, b)
+                    if d2 <= thick2:
                         self.obst[i, j] = 1
                         self.dye[i, j] = 0.0
                         self.vel[i, j] = ti.Vector([0.0, 0.0])
-                continue
 
-            # --- Otherwise: inject forces into fluid ---
+                self.draw_prev[hid] = b
+                self.draw_has_prev[hid] = 1
+                continue
+            else:
+                self.draw_has_prev[hid] = 0
+
+            # ---------------- Fluid force injection ----------------
             r = ti.cast(self.force_radius, ti.i32)
             cx = ti.cast(p[0], ti.i32)
             cy = ti.cast(p[1], ti.i32)
@@ -383,76 +462,107 @@ class ParticleSimTaichi:
 
                 w = ti.exp(-r2 / (self.force_sigma2 + 1e-6))
 
-                # wake / steering (momentum injection)
-                push = v * (self.push_gain * w)
+                push = v * (ti.cast(self.push_gain, ti.f32) * w)
 
-                # swirl injection (signed tangential) based on cross(r, v)
                 cross = dx * v[1] - dy * v[0]
                 perp = ti.Vector([-dy, dx])
                 perp_norm = perp / (ti.sqrt(r2) + 1e-4)
-                swirl = perp_norm * (self.swirl_gain * w * cross / (r2 + 6.0))
+                swirl = perp_norm * (ti.cast(self.swirl_gain, ti.f32) * w * cross / (r2 + 10.0))
 
-                # pinch compress/expand (feels like squeezing the flow)
                 dir_in = ti.Vector([-dx, -dy]) / (ti.sqrt(r2) + 1e-4)
-                pinch_force = dir_in * (self.pinch_gain * w * (closed - 0.35 * open_amt))
+                pinch_force = dir_in * (ti.cast(self.pinch_gain, ti.f32) * w * (closed - 0.25 * open_amt))
 
                 dv = (push + swirl + pinch_force) * dt
                 ti.atomic_add(self.vel[i, j][0], dv[0])
                 ti.atomic_add(self.vel[i, j][1], dv[1])
+                ti.atomic_add(self.dye[i, j], ti.cast(self.dye_inject, ti.f32) * w * dt)
 
-                # dye injection to visualize motion
-                ti.atomic_add(self.dye[i, j], self.dye_inject * w * dt)
+        # ---------------- Two-pointer interaction ----------------
+        # If both hands present and NOT drawing walls, allow grab/stretch always.
+        if self.hand_present[0] == 1 and self.hand_present[1] == 1:
+            pinch0 = self.hand_pinch[0]
+            pinch1 = self.hand_pinch[1]
 
-        # Pair grab/stretch (only if both hands present AND neither is drawing)
-        if (self.hand_present[0] == 1 and self.hand_present[1] == 1 and
-            self.hand_pinch[0] < ti.cast(self.draw_obstacle_when_pinch, ti.f32) and
-            self.hand_pinch[1] < ti.cast(self.draw_obstacle_when_pinch, ti.f32)):
+            # avoid interacting through solid-draw pinch in DRAW mode
+            drawing0 = 0
+            drawing1 = 0
+            if self.tool_mode == self.TOOL_DRAW and pinch0 >= ti.cast(self.draw_obstacle_when_pinch, ti.f32):
+                drawing0 = 1
+            if self.tool_mode == self.TOOL_DRAW and pinch1 >= ti.cast(self.draw_obstacle_when_pinch, ti.f32):
+                drawing1 = 1
 
-            p0 = self._uv_to_grid(self.hand_pos_uv[0])
-            p1 = self._uv_to_grid(self.hand_pos_uv[1])
-            v0 = ti.Vector([self.hand_vel_uv[0][0] * float(self.W), self.hand_vel_uv[0][1] * float(self.H)])
-            v1 = ti.Vector([self.hand_vel_uv[1][0] * float(self.W), self.hand_vel_uv[1][1] * float(self.H)])
+            if drawing0 == 0 and drawing1 == 0:
+                p0 = self._uv_to_grid(self.hand_pos_uv[0])
+                p1 = self._uv_to_grid(self.hand_pos_uv[1])
 
-            d = p1 - p0
-            L = ti.sqrt(d.dot(d)) + 1e-4
-            dhat = d / L
-            mid = (p0 + p1) * 0.5
-            stretch_rate = (v1 - v0).dot(dhat)
+                v0 = ti.Vector([self.hand_vel_uv[0][0] * float(self.W), self.hand_vel_uv[0][1] * float(self.H)]) * ti.cast(self.input_vel_scale, ti.f32)
+                v1 = ti.Vector([self.hand_vel_uv[1][0] * float(self.W), self.hand_vel_uv[1][1] * float(self.H)]) * ti.cast(self.input_vel_scale, ti.f32)
 
-            r = ti.cast(self.pair_radius, ti.i32)
-            cx = ti.cast(mid[0], ti.i32)
-            cy = ti.cast(mid[1], ti.i32)
-            x0 = ti.max(0, cx - r)
-            x1 = ti.min(self.W - 1, cx + r)
-            y0 = ti.max(0, cy - r)
-            y1 = ti.min(self.H - 1, cy + r)
+                d = p1 - p0
+                L = ti.sqrt(d.dot(d)) + 1e-4
+                dhat = d / L
+                mid = (p0 + p1) * 0.5
+                stretch_rate = (v1 - v0).dot(dhat)
 
-            for i, j in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
-                if self.obst[i, j] == 1:
-                    continue
+                # Normal direction for extrude sheet
+                n = ti.Vector([-dhat[1], dhat[0]])
 
-                x = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
+                r = ti.cast(self.pair_radius, ti.i32)
+                cx = ti.cast(mid[0], ti.i32)
+                cy = ti.cast(mid[1], ti.i32)
+                x0 = ti.max(0, cx - r)
+                x1 = ti.min(self.W - 1, cx + r)
+                y0 = ti.max(0, cy - r)
+                y1 = ti.min(self.H - 1, cy + r)
 
-                t = (x - p0).dot(dhat)
-                t = self._clampf(t, 0.0, L)
-                c = p0 + dhat * t
+                extrude_active = 0
+                if self.tool_mode == self.TOOL_EXTRUDE:
+                    if pinch0 >= ti.cast(self.extrude_pinch_min, ti.f32) and pinch1 >= ti.cast(self.extrude_pinch_min, ti.f32):
+                        extrude_active = 1
+                    # if either is fully closed beyond draw threshold, treat as “locked” (still allow extrude)
+                    # (no-op here; just makes it feel usable)
 
-                s = x - c
-                s2 = s.dot(s)
-                if s2 > (self.pair_radius * self.pair_radius):
-                    continue
+                for i, j in ti.ndrange((x0, x1 + 1), (y0, y1 + 1)):
+                    if self.obst[i, j] == 1:
+                        continue
 
-                w = ti.exp(-s2 / (self.pair_sigma2 + 1e-6))
+                    x = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
 
-                grab_dir = -s / (ti.sqrt(s2) + 1e-4)
-                grab = grab_dir * (self.pair_grab_gain * w)
+                    # closest point on segment
+                    t = (x - p0).dot(dhat)
+                    t = self._clampf(t, 0.0, L)
+                    c = p0 + dhat * t
 
-                along = (x - mid).dot(dhat)
-                stretch = dhat * (self.pair_stretch_gain * w * along * stretch_rate / (L + 1.0))
+                    s = x - c
+                    s2 = s.dot(s)
+                    if s2 > (self.pair_radius * self.pair_radius):
+                        continue
 
-                dv = (grab + stretch) * dt
-                ti.atomic_add(self.vel[i, j][0], dv[0])
-                ti.atomic_add(self.vel[i, j][1], dv[1])
+                    w = ti.exp(-s2 / (ti.cast(self.pair_sigma2, ti.f32) + 1e-6))
+
+                    # grab toward the segment (like grabbing a “sheet”)
+                    grab_dir = -s / (ti.sqrt(s2) + 1e-4)
+                    grab = grab_dir * (ti.cast(self.pair_grab_gain, ti.f32) * w)
+
+                    # stretch along the segment
+                    along = (x - mid).dot(dhat)
+                    stretch = dhat * (ti.cast(self.pair_stretch_gain, ti.f32) * w * along * stretch_rate / (L + 1.0))
+
+                    dv = (grab + stretch) * dt
+
+                    # EXTRUDE: pinch both + spread/squeeze => push fluid away/toward the segment on both sides
+                    if extrude_active == 1:
+                        side = (x - mid).dot(n)
+                        sgn = 1.0
+                        if side < 0.0:
+                            sgn = -1.0
+                        extr = n * (ti.cast(self.extrude_gain, ti.f32) * w * stretch_rate * sgn)
+                        dv += extr * dt
+                        ti.atomic_add(self.dye[i, j], ti.cast(self.extrude_dye, ti.f32) * w * ti.abs(stretch_rate) * dt)
+
+                    ti.atomic_add(self.vel[i, j][0], dv[0])
+                    ti.atomic_add(self.vel[i, j][1], dv[1])
+
     @ti.kernel
     def _apply_obstacles(self):
         for i, j in ti.ndrange(self.W, self.H):
@@ -460,8 +570,16 @@ class ParticleSimTaichi:
                 self.vel[i, j] = ti.Vector([0.0, 0.0])
                 self.dye[i, j] = 0.0
 
+    @ti.kernel
+    def _clamp_velocity(self):
+        vmax = ti.cast(self.vel_limit, ti.f32)
+        for i, j in ti.ndrange(self.W, self.H):
+            v = self.vel[i, j]
+            s = ti.sqrt(v.dot(v)) + 1e-6
+            if s > vmax:
+                self.vel[i, j] = v * (vmax / s)
 
-    # ========================= Viscosity (diffuse velocity) =========================
+    # ===================== Viscosity =====================
 
     def _diffuse_velocity(self, dt):
         a = self.viscosity * dt
@@ -495,7 +613,7 @@ class ParticleSimTaichi:
             s = src[im, j] + src[ip, j] + src[i, jm] + src[i, jp]
             dst[i, j] = (v0 + a * s) / denom
 
-    # ========================= Projection (incompressible) =========================
+    # ===================== Projection =====================
 
     def _project(self):
         self._compute_divergence()
@@ -560,7 +678,7 @@ class ParticleSimTaichi:
             grady = 0.5 * (self.p[i, jp] - self.p[i, jm])
             self.vel[i, j] -= ti.Vector([gradx, grady])
 
-    # ========================= Advection =========================
+    # ===================== Advection =====================
 
     @ti.kernel
     def _advect_velocity(self, dt: ti.f32):
@@ -573,7 +691,7 @@ class ParticleSimTaichi:
                 continue
 
             x = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
-            v = self.vel0[i, j] * self.advect_strength
+            v = self.vel0[i, j] * ti.cast(self.advect_strength, ti.f32)
             back = x - v * dt
             self.vel[i, j] = self._bilerp_vec2(self.vel0, back[0], back[1])
 
@@ -588,18 +706,19 @@ class ParticleSimTaichi:
                 continue
 
             x = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
-            v = self.vel[i, j] * self.advect_strength
+            v = self.vel[i, j] * ti.cast(self.advect_strength, ti.f32)
             back = x - v * dt
             self.dye[i, j] = self._bilerp_s(self.dye0, back[0], back[1])
 
     @ti.kernel
     def _decay_dye(self):
+        dec = ti.cast(self.dye_decay, ti.f32)
         for i, j in ti.ndrange(self.W, self.H):
-            self.dye[i, j] *= self.dye_decay
+            self.dye[i, j] *= dec
             if self.dye[i, j] < 1e-6:
                 self.dye[i, j] = 0.0
 
-    # ========================= Diagnostics =========================
+    # ===================== Diagnostics =====================
 
     @ti.kernel
     def _compute_diagnostics(self):
