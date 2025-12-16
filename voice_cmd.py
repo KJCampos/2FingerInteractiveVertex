@@ -47,13 +47,12 @@ class VoiceCommands:
 
         self._cmd_phrases = [
             self.wake_word,
-            "clear", "reset",
-            "line", "curve", "grab", "solid",
-            "wire", "neon", "holo", "xray",
-            "snap on", "snap off",
-            "axis on", "axis off",
-            "grid on", "grid off",
-            "projector",
+            "clear",
+            "clear all",
+            "delete",
+            "reset",
+            "line",
+            "curve",
         ]
         grammar = json.dumps(self._cmd_phrases)
         self.rec = KaldiRecognizer(self.model, self.sample_rate, grammar)
