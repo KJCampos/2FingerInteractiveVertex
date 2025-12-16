@@ -9,6 +9,7 @@ import requests
 from sim_taichi import ParticleSimTaichi
 from params import Params
 from predictor import AlphaBetaPredictor
+from hud_lines import HUDLines
 
 STREAM_TO_SERVER = True
 SERVER_HAND_URL = "http://127.0.0.1:8765/hand"
@@ -54,14 +55,8 @@ def init_taichi():
 
 
 def _pick_hand_tracker():
-    """
-    Don’t assume a class name. Works with:
-      - any class that has .process(frame)
-      - OR a module-level hands.process(frame) function
-    """
     hands_mod = importlib.import_module("hands")
 
-    # 1) common names
     common = ["HandTracker", "Hands", "HandTracking", "Tracker", "HandDetector"]
     for name in common:
         obj = getattr(hands_mod, name, None)
@@ -73,7 +68,6 @@ def _pick_hand_tracker():
             if callable(getattr(inst, "process", None)):
                 return inst
 
-    # 2) any class with process()
     for name, obj in vars(hands_mod).items():
         if isinstance(obj, type):
             try:
@@ -84,7 +78,6 @@ def _pick_hand_tracker():
                 print(f"✅ Using hands.{name}() as tracker")
                 return inst
 
-    # 3) module-level process(frame)
     if callable(getattr(hands_mod, "process", None)):
 
         class _FuncTracker:
@@ -103,13 +96,6 @@ def _pick_hand_tracker():
 
 
 def _as_hands_list(hand_result):
-    """
-    Normalize tracker output into a list of hand dicts.
-    Accepts:
-      - None
-      - {"landmarks_px":[...]} (single hand)
-      - {"hands":[{...},{...}]} (multi-hand)
-    """
     if hand_result is None:
         return []
     if isinstance(hand_result, dict) and isinstance(hand_result.get("hands"), list):
@@ -133,7 +119,6 @@ def _tip_uv(lms_px, idx, w, h):
 
 
 def _pinch_from_lms(lms_px, w, h):
-    # MediaPipe indices: thumb tip=4, index tip=8
     idx_uv, _ = _tip_uv(lms_px, 8, w, h)
     thb_uv, _ = _tip_uv(lms_px, 4, w, h)
     dx = idx_uv[0] - thb_uv[0]
@@ -157,7 +142,12 @@ def main():
     tracker = _pick_hand_tracker()
     sim = ParticleSimTaichi(params=params)
 
-    # Predictors (one per pointer id)
+    # Tony HUD interface layer (2-finger line tool)
+    hud = HUDLines(
+        grid_w=getattr(params, "grid_w", 240),
+        grid_h=getattr(params, "grid_h", 135),
+    )
+
     pred = [
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
@@ -187,18 +177,11 @@ def main():
         hand_result = tracker.process(frame)
         hands = _as_hands_list(hand_result)
 
-        # Defaults (2 pointers)
         active = [0, 0]
         pinch_val = [0.0, 0.0]
         pos_uv_raw = [(0.0, 0.0), (0.0, 0.0)]
 
-        # ---- Pointer selection ----
-        # If 2+ hands:
-        #   pointer0 = hand0 index tip
-        #   pointer1 = hand1 index tip
-        # If 1 hand:
-        #   pointer0 = index tip
-        #   pointer1 = thumb tip (so you can pinch/scale with 2 fingertips)
+        # Pointer selection
         if len(hands) >= 2:
             for hid in range(2):
                 lms = _get_landmarks_px(hands[hid])
@@ -212,8 +195,8 @@ def main():
                 pinch_val[hid] = _pinch_from_lms(lms, w, h)
 
                 if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 7, (255, 255, 0), -1)  # index tip
-                    cv2.circle(frame, thb_px, 7, (255, 0, 255), -1)  # thumb tip
+                    cv2.circle(frame, idx_px, 7, (255, 255, 0), -1)
+                    cv2.circle(frame, thb_px, 7, (255, 0, 255), -1)
 
                 if DRAW_ALL_LANDMARKS:
                     for (lx, ly) in lms:
@@ -227,7 +210,6 @@ def main():
 
                 pinch = _pinch_from_lms(lms, w, h)
 
-                # Two fingertip pointers from one hand
                 active[0] = 1
                 active[1] = 1
                 pos_uv_raw[0] = idx_uv
@@ -236,19 +218,14 @@ def main():
                 pinch_val[1] = pinch
 
                 if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 8, (255, 255, 0), -1)  # index tip
-                    cv2.circle(frame, thb_px, 8, (255, 0, 255), -1)  # thumb tip
+                    cv2.circle(frame, idx_px, 8, (255, 255, 0), -1)
+                    cv2.circle(frame, thb_px, 8, (255, 0, 255), -1)
 
                 if DRAW_ALL_LANDMARKS:
                     for (lx, ly) in lms:
                         cv2.circle(frame, (int(lx), int(ly)), 2, (0, 255, 0), -1)
-        else:
-            # no hands
-            active = [0, 0]
-            pinch_val = [0.0, 0.0]
-            pos_uv_raw = [(0.0, 0.0), (0.0, 0.0)]
 
-        # ---- Predict + send to sim ----
+        # Predict + send to sim
         pos_uv_send = [(0.0, 0.0), (0.0, 0.0)]
         vel_uv_send = [(0.0, 0.0), (0.0, 0.0)]
 
@@ -269,21 +246,25 @@ def main():
             sim.set_hand_input(
                 pos_uv_send[hid],
                 vel_uv_send[hid],
-                pinch_val[hid],  # your sim can use this if you want
+                pinch_val[hid],
                 hand_present=bool(active[hid]),
                 hand_id=hid,
             )
 
-        # optional: draw predicted dots (so you can see the smoothing)
         if DRAW_POINTERS and USE_PREDICTION:
             for hid in range(2):
                 if active[hid]:
                     px = int(pos_uv_send[hid][0] * w)
                     py = int(pos_uv_send[hid][1] * h)
-                    cv2.circle(frame, (px, py), 6, (255, 0, 0), -1)  # predicted dot
+                    cv2.circle(frame, (px, py), 6, (255, 0, 0), -1)
 
+        # ---- step + render sim ----
         sim.step(dt)
         sim.render_on_frame(frame)
+
+        # ---- HUD interface update + render ----
+        hud.update(pos_uv_send, pinch_val, active, w, h)
+        hud.render(frame)
 
         # ---- Optional stream ----
         if STREAM_TO_SERVER:
@@ -324,9 +305,11 @@ def main():
 
         cv2.imshow(WINDOW_NAME, frame)
         key = cv2.waitKey(1) & 0xFF
+
+        # forward keys to BOTH systems
+        hud.handle_key(key)
         sim.handle_key(key)
 
-        # close with X
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
         if key in (27, ord("q")):
