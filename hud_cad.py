@@ -80,7 +80,30 @@ class HUDCAD:
 
     RENDER_WIRE = 0
     RENDER_NEON = 1
-
+    def handle_voice(self, cmd: str):
+        cmd = (cmd or "").strip().lower()
+        if cmd == "clear":
+            self.clear()      # or whatever your clear function is named
+            return
+        if cmd == "reset":
+            self.reset()      # same idea
+            return
+        if cmd == "line":
+            self.tool = self.TOOL_LINE
+            return
+        if cmd == "curve":
+            self.tool = self.TOOL_CURVE
+            return
+        if cmd == "mode":
+            self.cycle_render_mode()
+            return
+        if cmd == "wire":
+            self.render_mode = self.RENDER_WIRE
+            return
+        if cmd == "solid":
+            self.render_mode = self.RENDER_SOLID
+            return
+        
     def __init__(self):
         # --- user feel/tuning ---
         self.pinch_on = 0.75
@@ -238,7 +261,6 @@ class HUDCAD:
 
         self._prev_both_pinched = both_pinched
         self._prev_pinch0 = p0
-
 
     def render(self, frame):
         # committed lines

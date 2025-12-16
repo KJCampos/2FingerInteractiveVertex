@@ -1,26 +1,21 @@
-# app.py (CAD HUD only — no Taichi)
+# app.py
 import time
 import importlib
 import cv2
 
 from hud_cad import HUDCAD
 from predictor import AlphaBetaPredictor
-from voice_cmd import VoiceCommands
 
-WINDOW_NAME = "2FingerInteractiveVertex - CAD HUD"
+WINDOW_NAME = "2FingerInteractiveVertex (HUD + 2.5D + 3D GPU View)"
 
-# Visual toggles
-DRAW_POINTERS = True
-DRAW_ALL_LANDMARKS = False
-
-# Predictive smoothing (feels good)
+# Predictive smoothing
 USE_PREDICTION = True
 PRED_LEAD_SEC = 1.0 / 60.0
 PRED_ALPHA = 0.85
 PRED_BETA = 0.02
 PRED_ADAPTIVE = True
 
-# Pinch tuning in normalized UV space (index-tip to thumb-tip distance)
+# Pinch tuning (UV dist)
 PINCH_OPEN_DIST = 0.12
 PINCH_ACTIVE_THRESH = 0.10
 
@@ -67,15 +62,10 @@ def _pick_hand_tracker():
             def process(self, frame):
                 return hands_mod.process(frame)
 
-        print("✅ Using hands.process(frame) function as tracker")
+        print("✅ Using hands.process(frame)")
         return _FuncTracker()
 
-    available = sorted([k for k in vars(hands_mod).keys() if not k.startswith("_")])
-    raise ImportError(
-        "Could not find a hand-tracker class/function in hands.py.\n"
-        f"Exports found: {available}\n"
-        "Expected either a class with .process(frame) or a module function process(frame)."
-    )
+    raise ImportError("Could not find a tracker in hands.py (needs .process(frame)).")
 
 
 def _as_hands_list(hand_result):
@@ -89,51 +79,36 @@ def _as_hands_list(hand_result):
 
 
 def _get_landmarks_px(hand):
-    """
-    Your hands.py spec says it returns:
-      {"hands": [{"landmarks_px": [(x,y)*21]}, ...]}
-    But we also accept older shapes for safety.
-    """
     if hand is None:
         return None
     if isinstance(hand, dict):
-        for k in ("landmarks_px", "landmarks", "lm", "lms"):
-            if k in hand:
-                return hand[k]
-        return None
-
-    # object style
-    for attr in ("landmarks_px", "landmarks", "lm", "lms"):
-        if hasattr(hand, attr):
-            return getattr(hand, attr)
-
-    if isinstance(hand, (list, tuple)) and len(hand) >= 10:
-        return hand
-
+        return hand.get("landmarks_px", hand.get("landmarks", None))
+    lms = getattr(hand, "landmarks_px", None)
+    if lms is not None:
+        return lms
+    lms = getattr(hand, "landmarks", None)
+    if lms is not None:
+        return lms
     return None
 
 
 def _tip_uv(lms, idx, w, h):
     x, y = lms[idx][0], lms[idx][1]
-    # if normalized
     if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
         uv = (float(x), float(y))
         px = (int(x * w), int(y * h))
         return uv, px
-    # assume pixels
     px = (int(x), int(y))
     uv = (float(px[0]) / float(w), float(px[1]) / float(h))
     return uv, px
 
 
 def _pinch_from_lms(lms, w, h):
-    idx_uv, _ = _tip_uv(lms, 8, w, h)   # index tip
-    thb_uv, _ = _tip_uv(lms, 4, w, h)   # thumb tip
-
+    idx_uv, _ = _tip_uv(lms, 8, w, h)
+    thb_uv, _ = _tip_uv(lms, 4, w, h)
     dx = idx_uv[0] - thb_uv[0]
     dy = idx_uv[1] - thb_uv[1]
     d = (dx * dx + dy * dy) ** 0.5
-
     pinch = 1.0 - min(1.0, max(0.0, d / float(PINCH_OPEN_DIST)))
     if d > PINCH_ACTIVE_THRESH:
         pinch *= 0.85
@@ -142,127 +117,102 @@ def _pinch_from_lms(lms, w, h):
 
 def main():
     cap = open_camera()
-    hand_tracker = _pick_hand_tracker()
+    tracker = _pick_hand_tracker()
 
     hud = HUDCAD()
-    voice = None
-    try:
-        voice = VoiceCommands()
-        voice.start()
-        print("✅ Voice commands ON")
-    except Exception as e:
-        print(f"⚠️ Voice commands OFF ({e})")
-        
+
     pred = [
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
         AlphaBetaPredictor(alpha=PRED_ALPHA, beta=PRED_BETA, adaptive=PRED_ADAPTIVE),
     ]
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    prev_time = time.time()
+    #cv2.setMouseCallback(WINDOW_NAME, hud.on_mouse)
+
+    prev = time.time()
     fps_smooth = 0.0
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            print("❌ Frame grab failed")
             break
 
         frame = cv2.flip(frame, 1)
-        h, w = frame.shape[:2]
+        H, W = frame.shape[:2]
+
         now = time.time()
-        dt = max(1e-6, now - prev_time)
-        prev_time = now
-
+        dt = max(1e-6, now - prev)
+        prev = now
         fps = 1.0 / dt
-        fps_smooth = 0.9 * fps_smooth + 0.1 * fps if fps_smooth > 0 else fps
+        fps_smooth = fps if fps_smooth == 0 else 0.9 * fps_smooth + 0.1 * fps
 
-        # ---- hand tracking ----
-        res = hand_tracker.process(frame)
+        res = tracker.process(frame)
         hands = _as_hands_list(res)
 
+        # default
         active = [0, 0]
-        pinch_val = [0.0, 0.0]
-        pos_uv_raw = [(0.0, 0.0), (0.0, 0.0)]
+        pinch = [0.0, 0.0]
+        pos_uv = [(0.5, 0.5), (0.5, 0.5)]
+        vel_uv = [(0.0, 0.0), (0.0, 0.0)]
 
+        # pointers mapping:
+        # - 2 hands: both index tips
+        # - 1 hand: pointer0=index tip, pointer1=thumb tip
         if len(hands) >= 2:
             for hid in range(2):
                 lms = _get_landmarks_px(hands[hid])
                 if lms is None:
                     continue
-
-                idx_uv, idx_px = _tip_uv(lms, 8, w, h)
+                uv, _ = _tip_uv(lms, 8, W, H)
                 active[hid] = 1
-                pos_uv_raw[hid] = idx_uv
-                pinch_val[hid] = _pinch_from_lms(lms, w, h)
-
-                if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 7, (235, 245, 255), -1, lineType=cv2.LINE_AA)
-
-                if DRAW_ALL_LANDMARKS:
-                    for (lx, ly, *rest) in lms:
-                        cv2.circle(frame, (int(lx), int(ly)), 2, (160, 220, 255), -1)
-
+                pinch[hid] = _pinch_from_lms(lms, W, H)
+                pos_uv[hid] = uv
         elif len(hands) == 1:
             lms = _get_landmarks_px(hands[0])
             if lms is not None:
-                idx_uv, idx_px = _tip_uv(lms, 8, w, h)
-                thb_uv, thb_px = _tip_uv(lms, 4, w, h)
-                pinch = _pinch_from_lms(lms, w, h)
+                uv0, _ = _tip_uv(lms, 8, W, H)  # index tip
+                uv1, _ = _tip_uv(lms, 4, W, H)  # thumb tip
+                active = [1, 1]
+                pinch0 = _pinch_from_lms(lms, W, H)
+                pinch = [pinch0, pinch0]
+                pos_uv = [uv0, uv1]
 
-                active[0] = 1
-                active[1] = 1
-                pos_uv_raw[0] = idx_uv
-                pos_uv_raw[1] = thb_uv
-                pinch_val[0] = pinch
-                pinch_val[1] = pinch
-
-                if DRAW_POINTERS:
-                    cv2.circle(frame, idx_px, 7, (235, 245, 255), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(frame, thb_px, 7, (180, 240, 255), -1, lineType=cv2.LINE_AA)
-
-        # ---- prediction (the “after this feels good” part) ----
-        pos_uv_send = [(0.0, 0.0), (0.0, 0.0)]
-        vel_uv_send = [(0.0, 0.0), (0.0, 0.0)]
-        for hid in range(2):
-            if active[hid]:
+        # predictive smoothing (optional)
+        pos_uv_send = []
+        vel_uv_send = []
+        t_now = now
+        for i in range(2):
+            if active[i]:
+                pred[i].update(pos_uv[i], t_now)
                 if USE_PREDICTION:
-                    pred[hid].update(pos_uv_raw[hid], now)
-                    pos_uv_send[hid] = pred[hid].predict(now + PRED_LEAD_SEC)
-                    vel_uv_send[hid] = pred[hid].velocity()
+                    p = pred[i].predict(t_now + PRED_LEAD_SEC)
                 else:
-                    pos_uv_send[hid] = pos_uv_raw[hid]
-                    vel_uv_send[hid] = (0.0, 0.0)
+                    p = pos_uv[i]
+                v = pred[i].velocity()
+                pos_uv_send.append(p)
+                vel_uv_send.append(v)
             else:
-                pred[hid].reset()
+                pred[i].reset()
+                pos_uv_send.append(pos_uv[i])
+                vel_uv_send.append((0.0, 0.0))
 
-        # HUD update + render (dt supported now)
-        hud.update(pos_uv_send, vel_uv_send, pinch_val, active, w, h, dt=dt)
-        hud.render(frame)
+        # update HUD + geometry + physics
+        hud.update(pos_uv_send, vel_uv_send, pinch, active, W, H, dt=dt)
 
-        cv2.putText(
-            frame,
-            f"FPS: {fps_smooth:.1f}",
-            (20, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (235, 245, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        if voice:
-            for phrase in voice.poll():
-                hud.apply_voice(phrase)
+        # render
+        composed = hud.render(frame)
 
-        cv2.imshow(WINDOW_NAME, frame)
+        # FPS overlay
+        cv2.putText(composed, f"{fps_smooth:5.1f} FPS", (12, composed.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 240, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow(WINDOW_NAME, composed)
+
         key = cv2.waitKey(1) & 0xFF
-
-        hud.handle_key(key)
-
-        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+        if key == 27:  # ESC
             break
-        if key in (27, ord("q")):
-            break
+        if key != 255:
+            hud.on_key(key)
 
     cap.release()
     cv2.destroyAllWindows()
