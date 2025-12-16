@@ -1,11 +1,9 @@
 import taichi as ti
-import taichi.math as tm
 import numpy as np
 # pyright: reportInvalidTypeForm=false
 
 
 def _pget(p, key, default=None):
-    # Works for dicts and objects (dataclass / SimpleNamespace)
     if isinstance(p, dict):
         return p.get(key, default)
     return getattr(p, key, default)
@@ -18,15 +16,14 @@ class ParticleSimTaichi:
 
     app.py expects:
       sim = ParticleSimTaichi(params=params)
-      sim.step()
-      sim.set_hand_input((x,y), (vx,vy), dt, hand_present=bool)
-      sim.get_positions()   # Nx2 float32 in [0..1]
+      sim.step(dt)
+      sim.set_hand_input((x,y), (vx,vy), pinch, hand_present=bool, hand_id=0/1)
+      sim.get_positions()  # Nx2 float32 in [0..1]
+      sim.render_on_frame(frame)
     """
 
     def __init__(self, params):
-        # NOTE: ti.init() MUST be called in app.py before constructing this class.
-
-        # --- params (dict or Params object) ---
+        # --- params ---
         self.n = int(_pget(params, "n_particles", _pget(params, "n", 4096)))
 
         dt = float(_pget(params, "dt", 1.0 / 120.0))
@@ -36,8 +33,7 @@ class ParticleSimTaichi:
         bounce = float(_pget(params, "bounce", 0.6))
         seed = int(_pget(params, "seed", 1234))
 
-        # --- scalar params in 0-d fields (kernel-friendly) ---
-        # (shape=() is fine for scalar ti.field; your earlier crash was Vector.field(shape=()))
+        # --- scalar params ---
         self.dt = ti.field(dtype=ti.f32, shape=())
         self.damping = ti.field(dtype=ti.f32, shape=())
         self.hand_radius = ti.field(dtype=ti.f32, shape=())
@@ -54,86 +50,100 @@ class ParticleSimTaichi:
         self.pos = ti.Vector.field(2, dtype=ti.f32, shape=(self.n,))
         self.vel = ti.Vector.field(2, dtype=ti.f32, shape=(self.n,))
 
-        # --- hand input (avoid shape=()) ---
-        self.hand_pos = ti.Vector.field(2, dtype=ti.f32, shape=(1,))
-        self.hand_vel = ti.Vector.field(2, dtype=ti.f32, shape=(1,))
-        self.hand_active = ti.field(dtype=ti.i32, shape=(1,))
+        # --- 2 pointers / 2 hands ---
+        self.max_hands = 2
+        self.hand_pos = ti.Vector.field(2, dtype=ti.f32, shape=(self.max_hands,))
+        self.hand_vel = ti.Vector.field(2, dtype=ti.f32, shape=(self.max_hands,))
+        self.hand_active = ti.field(dtype=ti.i32, shape=(self.max_hands,))
+        self.hand_pinch = ti.field(dtype=ti.f32, shape=(self.max_hands,))
 
         self._init_particles(seed)
 
-    # -------------------- init --------------------
+        # render buffer (allocated lazily)
+        self._dens = None
+        self._dens_shape = None
+
+    @ti.func
+    def _fract(self, x):
+        # fract(x) = x - floor(x), works for negatives too
+        return x - ti.floor(x)
 
     @ti.kernel
     def _init_particles(self, seed: ti.i32):
         for i in range(self.n):
             a = ti.sin(ti.cast(i * 97 + seed, ti.f32)) * 43758.5453
             b = ti.sin(ti.cast(i * 57 + seed * 3, ti.f32)) * 24634.6345
-            x = tm.fract(a)
-            y = tm.fract(b)
+            x = self._fract(a)
+            y = self._fract(b)
             self.pos[i] = ti.Vector([x, y])
             self.vel[i] = ti.Vector([0.0, 0.0])
 
-        self.hand_pos[0] = ti.Vector([0.5, 0.5])
-        self.hand_vel[0] = ti.Vector([0.0, 0.0])
-        self.hand_active[0] = 0
+        for h in ti.static(range(2)):
+            self.hand_pos[h] = ti.Vector([0.5, 0.5])
+            self.hand_vel[h] = ti.Vector([0.0, 0.0])
+            self.hand_active[h] = 0
+            self.hand_pinch[h] = 0.0
 
     # -------------------- hand control --------------------
 
     @ti.kernel
-    def _set_hand_kernel(self, x: ti.f32, y: ti.f32, vx: ti.f32, vy: ti.f32, active: ti.i32):
-        # Clamp position to [0..1] for stability
-        self.hand_pos[0] = ti.Vector([ti.min(1.0, ti.max(0.0, x)), ti.min(1.0, ti.max(0.0, y))])
-        self.hand_vel[0] = ti.Vector([vx, vy])
-        self.hand_active[0] = active
+    def _set_hand_kernel(self, hid: ti.i32, x: ti.f32, y: ti.f32,
+                         vx: ti.f32, vy: ti.f32, active: ti.i32, pinch: ti.f32):
+        if 0 <= hid < 2:
+            # clamp pos to [0..1]
+            cx = ti.min(1.0, ti.max(0.0, x))
+            cy = ti.min(1.0, ti.max(0.0, y))
+            self.hand_pos[hid] = ti.Vector([cx, cy])
+            self.hand_vel[hid] = ti.Vector([vx, vy])
+            self.hand_active[hid] = active
+            self.hand_pinch[hid] = ti.min(1.0, ti.max(0.0, pinch))
 
-    def set_hand(self, x: float, y: float, vx: float = 0.0, vy: float = 0.0, active: int = 1):
-        """Direct API (normalized coords)."""
-        self._set_hand_kernel(float(x), float(y), float(vx), float(vy), int(active))
-
-    def set_hand_input(self, pos, vel, dt_unused=0.0, hand_present=True):
-        """
-        Compatibility wrapper for your app.py call:
-          sim.set_hand_input((x,y), (vx,vy), dt, hand_present=False/True)
-        """
+    def set_hand_input(self, pos, vel, pinch=0.0, hand_present=True, hand_id=0):
         x, y = float(pos[0]), float(pos[1])
         vx, vy = float(vel[0]), float(vel[1])
+        p = float(pinch)
         active = 1 if hand_present else 0
-        self.set_hand(x, y, vx, vy, active)
+        self._set_hand_kernel(int(hand_id), x, y, vx, vy, active, p)
 
     # -------------------- sim step --------------------
 
     @ti.kernel
     def step(self, dt_in: ti.f32):
-        hp = self.hand_pos[0]
-        hv = self.hand_vel[0]
-        ha = self.hand_active[0]
-
-        # use dt from app.py
         dt = dt_in
-
         damp = self.damping[None]
-        r = self.hand_radius[None]
-        strength = self.hand_strength[None]
+        base_r = self.hand_radius[None]
+        base_strength = self.hand_strength[None]
         bounce = self.bounce[None]
 
         for i in range(self.n):
             p = self.pos[i]
             v = self.vel[i]
 
-            if ha != 0:
-                d = p - hp
-                dist2 = d.dot(d) + 1e-6
-                dist = ti.sqrt(dist2)
+            # apply forces from both pointers
+            for h in ti.static(range(2)):
+                if self.hand_active[h] != 0:
+                    hp = self.hand_pos[h]
+                    hv = self.hand_vel[h]
+                    pinch = self.hand_pinch[h]
 
-                if dist < r:
-                    dir = d / dist
-                    t = 1.0 - (dist / r)
-                    v += dir * (strength * t) * dt
-                    v += hv * (0.25 * t) * dt
+                    # pinch affects radius + strength (feels more “grabby” when pinched)
+                    r = base_r * (0.75 + 0.75 * pinch)
+                    strength = base_strength * (0.50 + 1.50 * pinch)
+
+                    d = p - hp
+                    dist2 = d.dot(d) + 1e-6
+                    dist = ti.sqrt(dist2)
+
+                    if dist < r:
+                        t = 1.0 - (dist / r)
+                        dir = d / dist
+                        v += dir * (strength * t) * dt
+                        v += hv * (0.10 + 0.40 * pinch) * t * dt
 
             v *= damp
             p += v * dt
 
+            # bounds
             if p.x < 0.0:
                 p.x = 0.0
                 v.x = -v.x * bounce
@@ -150,51 +160,56 @@ class ParticleSimTaichi:
 
             self.pos[i] = p
             self.vel[i] = v
-            
+
     # -------------------- data access --------------------
 
     def get_positions(self) -> np.ndarray:
-        """Returns Nx2 float32 array in [0..1]."""
         return self.pos.to_numpy()
 
-    def set_positions(self, positions: np.ndarray):
-        """Optional: set positions from Nx2 numpy array."""
-        arr = np.asarray(positions, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] != 2:
-            raise ValueError("positions must be Nx2")
-        if arr.shape[0] != self.n:
-            raise ValueError(f"positions must have N={self.n} rows")
+    # -------------------- rendering (smoother, less pixel-noise) --------------------
 
-        arr = np.clip(arr, 0.0, 1.0)
-        self.pos.from_numpy(arr)
-        self.vel.from_numpy(np.zeros((self.n, 2), dtype=np.float32))
     def render_on_frame(self, frame):
-        """
-    Draw particles onto an HxWx3 uint8 frame (OpenCV BGR).
-    Modifies frame in-place and also returns it.
-        """
+        import cv2
+
         pos = self.get_positions()  # Nx2 in [0..1]
         h, w = frame.shape[:2]
-        if pos.size == 0:
-            return frame
 
-        # Convert normalized -> pixel coords
-        xs = (pos[:, 0] * (w - 1)).astype(np.int32)
-        ys = (pos[:, 1] * (h - 1)).astype(np.int32)
+        # Downsample density grid to reduce pixel/noise look
+        ds = 2  # 2 = half-res grid
+        gh = max(1, h // ds)
+        gw = max(1, w // ds)
 
-        # Clip to bounds
-        m = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if self._dens is None or self._dens_shape != (gh, gw):
+            self._dens = np.zeros((gh, gw), dtype=np.float32)
+            self._dens_shape = (gh, gw)
+
+        self._dens.fill(0.0)
+
+        xs = (pos[:, 0] * (gw - 1)).astype(np.int32)
+        ys = (pos[:, 1] * (gh - 1)).astype(np.int32)
+
+        m = (xs >= 0) & (xs < gw) & (ys >= 0) & (ys < gh)
         xs = xs[m]
         ys = ys[m]
 
-        # Draw as bright white pixels (BGR)
-        frame[ys, xs] = (255, 255, 255)
+        # accumulate density
+        np.add.at(self._dens, (ys, xs), 1.0)
 
-        # Optional: make points a tiny bit bigger (2x2)
-        x2 = np.clip(xs + 1, 0, w - 1)
-        y2 = np.clip(ys + 1, 0, h - 1)
-        frame[ys, x2] = (255, 255, 255)
-        frame[y2, xs] = (255, 255, 255)
-        frame[y2, x2] = (255, 255, 255)
+        # blur more => smoother “fluid”
+        dens = cv2.GaussianBlur(self._dens, (0, 0), sigmaX=3.5, sigmaY=3.5)
+        dens = cv2.GaussianBlur(dens, (0, 0), sigmaX=2.0, sigmaY=2.0)
 
+        mx = float(dens.max()) if dens.size else 1.0
+        if mx < 1e-6:
+            return frame
+
+        img_small = (dens / mx * 255.0).astype(np.uint8)
+        col_small = cv2.applyColorMap(img_small, cv2.COLORMAP_TURBO)
+
+        # upsample smoothly to full frame
+        col = cv2.resize(col_small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # blend onto camera
+        out = cv2.addWeighted(frame, 0.55, col, 0.45, 0.0)
+        frame[:] = out
         return frame

@@ -1,73 +1,60 @@
-"""
-Hand tracking wrapper using MediaPipe.
-
-We output:
-- palm_px: pixel coords of a "palm center" estimate
-- pinch: 0..1 (1 = thumb and index are close)
-- landmarks_px: list of 21 pixel points for debugging
-"""
-
 import cv2
-import mediapipe as mp
 import numpy as np
 
+import mediapipe as mp
 
-class HandTracker:
-    def __init__(self):
+THUMB_TIP = 4
+INDEX_TIP = 8
+
+
+class Hands:
+    """
+    MediaPipe hands wrapper.
+
+    Returns:
+      {"hands": [hand0, hand1, ...]}
+
+    Each hand dict contains:
+      - "landmarks_px": [(x,y)*21] pixel coords
+    """
+
+    def __init__(self, max_hands=2, det_conf=0.5, track_conf=0.5):
+        self.max_hands = max_hands
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=max_hands,
             model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=float(det_conf),
+            min_tracking_confidence=float(track_conf),
         )
 
     def process(self, frame_bgr):
-        h, w = frame_bgr.shape[:2]
-
-        # MediaPipe expects RGB
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        result = self.hands.process(frame_rgb)
 
-        if not result.multi_hand_landmarks:
+        # Fixes NORM_RECT without IMAGE_DIMENSIONS warning
+        self.hands._image_width, self.hands._image_height = frame_bgr.shape[1], frame_bgr.shape[0]  # type: ignore[attr-defined]
+
+        res = self.hands.process(frame_rgb)
+
+        if not res.multi_hand_landmarks:
             return None
 
-        hand_lms = result.multi_hand_landmarks[0]
+        h, w = frame_bgr.shape[:2]
+        out = {"hands": []}
 
-        # Convert landmarks to pixel coords
-        pts = []
-        for lm in hand_lms.landmark:
-            x = int(lm.x * w)
-            y = int(lm.y * h)
-            pts.append((x, y))
+        for hand_lms in res.multi_hand_landmarks:
+            pts = []
+            for lm in hand_lms.landmark:
+                pts.append((lm.x * w, lm.y * h))
+            out["hands"].append({"landmarks_px": pts})
 
-        # Landmark indices:
-        # 0 = wrist
-        # 4 = thumb tip
-        # 8 = index tip
-        wrist = pts[0]
-        thumb_tip = pts[4]
-        index_tip = pts[8]
+        return out
 
-        # Palm center estimate: average of wrist + a few knuckles
-        # (works well enough for MVP)
-        knuckle_ids = [0, 5, 9, 13, 17]  # wrist + finger MCP joints
-        palm_x = int(sum(pts[i][0] for i in knuckle_ids) / len(knuckle_ids))
-        palm_y = int(sum(pts[i][1] for i in knuckle_ids) / len(knuckle_ids))
-        palm_px = (palm_x, palm_y)
 
-        # Pinch strength from thumb-index distance (normalize by image size)
-        dist = np.hypot(thumb_tip[0] - index_tip[0], thumb_tip[1] - index_tip[1])
-        dist_norm = dist / max(w, h)
+# Make a default singleton to match app.py's "hands.process(frame)" fallback
+_default = Hands(max_hands=2)
 
-        close_dist = 0.02  # empirically chosen
-        far_dist = 0.10
 
-        pinch = 1.0 - np.clip((dist_norm - close_dist) / (far_dist - close_dist), 0.0, 1.0)
-
-        return {
-            "palm_px": palm_px,
-            "pinch": float(pinch),
-            "landmarks_px": pts
-        }
+def process(frame):
+    return _default.process(frame)
