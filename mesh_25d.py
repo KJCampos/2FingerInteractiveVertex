@@ -1,186 +1,140 @@
-# physics3d_ti.py
-# GPU-ish rigid approximation: one rigid body + plane contact + damping.
-# Stable "settles on plane" behavior, not a full rigid-body solver.
-# pyright: reportInvalidTypeForm=false
-
 from __future__ import annotations
-import taichi as ti
-
-_TAICHI_READY = False
-
-
-def ensure_ti():
-    global _TAICHI_READY
-    if _TAICHI_READY:
-        return
-    try:
-        ti.init(arch=ti.cuda, device_memory_fraction=0.7)
-        print("✅ Taichi CUDA (physics)")
-    except Exception:
-        ti.init(arch=ti.cpu)
-        print("⚠️ Taichi CPU fallback (physics)")
-    _TAICHI_READY = True
+from dataclasses import dataclass
+import math
+from typing import List, Tuple
+import numpy as np
 
 
-@ti.data_oriented
-class RigidBodyPlane:
-    def __init__(self, max_verts: int = 2048):
-        ensure_ti()
+@dataclass
+class Mesh25D:
+    verts: np.ndarray  # (N,3) float32
+    tris: np.ndarray   # (M,3) int32
 
-        self.max_verts = max_verts
-        self.v_body = ti.Vector.field(3, ti.f32, shape=max_verts)
-        self.v_count = ti.field(ti.i32, shape=())
 
-        # pose + motion
-        self.pos = ti.Vector.field(3, ti.f32, shape=())
-        self.vel = ti.Vector.field(3, ti.f32, shape=())
-        self.ang = ti.Vector.field(3, ti.f32, shape=())   # Euler (simple & stable here)
+def _area(poly: List[Tuple[float, float]]) -> float:
+    a = 0.0
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return 0.5 * a
 
-        # flags
-        self.enabled = ti.field(ti.i32, shape=())
 
-        # params
-        self.gravity = ti.Vector([0.0, -9.81, 0.0])
-        self.lin_damp = 0.985
-        self.ang_damp = 0.985
-        self.friction = 0.88
+def _is_clockwise(poly: List[Tuple[float, float]]) -> bool:
+    return _area(poly) < 0
 
-        self._min_y = ti.field(ti.f32, shape=())
 
-        # init
-        self.enabled[None] = 0
-        self.pos[None] = ti.Vector([0.0, 0.8, 0.0])
-        self.vel[None] = ti.Vector([0.0, 0.0, 0.0])
-        self.ang[None] = ti.Vector([0.0, 0.0, 0.0])
-        self.v_count[None] = 0
+def _remove_near_duplicates(poly: List[Tuple[float, float]], min_dist: float) -> List[Tuple[float, float]]:
+    cleaned: List[Tuple[float, float]] = []
+    for p in poly:
+        if not cleaned or math.hypot(p[0] - cleaned[-1][0], p[1] - cleaned[-1][1]) >= min_dist:
+            cleaned.append(p)
+    if len(cleaned) > 2 and math.hypot(cleaned[0][0] - cleaned[-1][0], cleaned[0][1] - cleaned[-1][1]) < min_dist:
+        cleaned[-1] = cleaned[0]
+        cleaned = cleaned[:-1]
+    return cleaned
 
-    def set_mesh_vertices(self, verts_body):
-        """
-        verts_body: numpy (V,3) float32
-        """
-        import numpy as np
-        verts_body = np.asarray(verts_body, dtype=np.float32)
-        n = min(len(verts_body), self.max_verts)
-        self.v_body.from_numpy(verts_body[:n])
-        self.v_count[None] = n
-        self.enabled[None] = 1
-        # reset pose
-        self.pos[None] = ti.Vector([0.0, 1.2, 0.0])
-        self.vel[None] = ti.Vector([0.0, 0.0, 0.0])
-        self.ang[None] = ti.Vector([0.0, 0.0, 0.0])
 
-    @ti.func
-    def _rot_x(self, a):
-        c = ti.cos(a)
-        s = ti.sin(a)
-        return ti.Matrix([[1.0, 0.0, 0.0],
-                          [0.0, c, -s],
-                          [0.0, s, c]])
+def _point_in_tri(p, a, b, c):
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    v0x, v0y = cx - ax, cy - ay
+    v1x, v1y = bx - ax, by - ay
+    v2x, v2y = px - ax, py - ay
 
-    @ti.func
-    def _rot_y(self, a):
-        c = ti.cos(a)
-        s = ti.sin(a)
-        return ti.Matrix([[c, 0.0, s],
-                          [0.0, 1.0, 0.0],
-                          [-s, 0.0, c]])
+    dot00 = v0x * v0x + v0y * v0y
+    dot01 = v0x * v1x + v0y * v1y
+    dot02 = v0x * v2x + v0y * v2y
+    dot11 = v1x * v1x + v1y * v1y
+    dot12 = v1x * v2x + v1y * v2y
 
-    @ti.func
-    def _rot_z(self, a):
-        c = ti.cos(a)
-        s = ti.sin(a)
-        return ti.Matrix([[c, -s, 0.0],
-                          [s, c, 0.0],
-                          [0.0, 0.0, 1.0]])
+    inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01 + 1e-9)
+    u = (dot11 * dot02 - dot01 * dot12) * inv_denom
+    v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+    return (u >= 0) and (v >= 0) and (u + v <= 1)
 
-    @ti.func
-    def _R(self):
-        a = self.ang[None]
-        # Z * Y * X (stable enough for our use)
-        return self._rot_z(a.z) @ self._rot_y(a.y) @ self._rot_x(a.x)
 
-    @ti.kernel
-    def _compute_min_y(self):
-        mn = 1e9
-        R = self._R()
-        p = self.pos[None]
-        for i in range(self.v_count[None]):
-            v = p + R @ self.v_body[i]
-            mn = ti.min(mn, v.y)
-        self._min_y[None] = mn
+def triangulate_earclip(poly: List[Tuple[float, float]]) -> List[Tuple[int, int, int]]:
+    n = len(poly)
+    if n < 3:
+        return []
 
-    @ti.kernel
-    def _step(self, dt: ti.f32):
-        if self.enabled[None] == 0:
-            return
+    indices = list(range(n))
+    tris: List[Tuple[int, int, int]] = []
 
-        # integrate
-        v = self.vel[None]
-        p = self.pos[None]
-        a = self.ang[None]
+    def is_convex(i0, i1, i2):
+        ax, ay = poly[i0]
+        bx, by = poly[i1]
+        cx, cy = poly[i2]
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) > 0
 
-        # gravity
-        v += self.gravity * dt
-        p += v * dt
+    guard = 0
+    while len(indices) > 3 and guard < 5000:
+        guard += 1
+        ear_found = False
+        for k in range(len(indices)):
+            i_prev = indices[(k - 1) % len(indices)]
+            i_curr = indices[k]
+            i_next = indices[(k + 1) % len(indices)]
 
-        # damping
-        v *= self.lin_damp
-        a *= self.ang_damp
+            if not is_convex(i_prev, i_curr, i_next):
+                continue
 
-        self.vel[None] = v
-        self.pos[None] = p
-        self.ang[None] = a
+            a, b, c = poly[i_prev], poly[i_curr], poly[i_next]
+            is_ear = True
+            for j in indices:
+                if j in (i_prev, i_curr, i_next):
+                    continue
+                if _point_in_tri(poly[j], a, b, c):
+                    is_ear = False
+                    break
+            if is_ear:
+                tris.append((i_prev, i_curr, i_next))
+                indices.pop(k)
+                ear_found = True
+                break
+        if not ear_found:
+            break
 
-    @ti.kernel
-    def _resolve_plane(self):
-        if self.enabled[None] == 0:
-            return
+    if len(indices) == 3:
+        tris.append(tuple(indices))
+    return tris
 
-        mn = self._min_y[None]
-        if mn < 0.0:
-            # push up
-            p = self.pos[None]
-            p.y -= mn
-            self.pos[None] = p
 
-            # kill downward velocity, apply friction to tangential motion
-            v = self.vel[None]
-            if v.y < 0:
-                v.y = 0.0
-            v.x *= self.friction
-            v.z *= self.friction
-            self.vel[None] = v
+def build_polygon_from_chain(points: List[Tuple[int, int]], min_dist_px: float = 4.0) -> List[Tuple[float, float]]:
+    if len(points) < 3:
+        return []
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    pts = _remove_near_duplicates(pts, min_dist_px)
+    if len(pts) < 3:
+        return []
+    if _is_clockwise(pts):
+        pts.reverse()
+    return pts
 
-            # angular "friction"
-            a = self.ang[None]
-            a *= 0.92
-            self.ang[None] = a
 
-    def step(self, dt: float, substeps: int = 2):
-        if self.enabled[None] == 0:
-            return
-        dt = float(max(1e-5, min(1.0 / 30.0, dt)))
-        for _ in range(max(1, int(substeps))):
-            self._step(dt / substeps)
-            self._compute_min_y()
-            self._resolve_plane()
+def extrude_polygon(poly_px: List[Tuple[float, float]], scale: float, thickness: float) -> Mesh25D:
+    poly = np.array(poly_px, dtype=np.float32)
+    center = np.mean(poly, axis=0)
+    centered = (poly - center) * float(scale)
+    n = len(centered)
 
-    def add_rotation(self, dx: float, dy: float):
-        # Called from mouse drag (CPU); apply to Euler angles
-        a = self.ang[None]
-        a.y += float(dx)
-        a.x += float(dy)
-        self.ang[None] = a
+    bottom = np.concatenate([centered, np.zeros((n, 1), dtype=np.float32)], axis=1)
+    top = np.concatenate([centered, np.full((n, 1), thickness, dtype=np.float32)], axis=1)
+    verts = np.vstack([bottom, top]).astype(np.float32)
 
-    def reset_rotation(self):
-        a = self.ang[None]
-        a.x = 0.0
-        a.y = 0.0
-        a.z = 0.0
-        self.ang[None] = a
+    tri_indices = triangulate_earclip(centered.tolist())
+    tris: List[Tuple[int, int, int]] = []
+    for a, b, c in tri_indices:
+        tris.append((a, b, c))
+        tris.append((a + n, c + n, b + n))
 
-    def get_pose(self):
-        # Return pose (pos, ang) for renderer
-        p = self.pos[None]
-        a = self.ang[None]
-        return (float(p.x), float(p.y), float(p.z)), (float(a.x), float(a.y), float(a.z))
+    for i in range(n):
+        j = (i + 1) % n
+        tris.append((i, j, i + n))
+        tris.append((j, j + n, i + n))
+
+    return Mesh25D(verts=verts, tris=np.array(tris, dtype=np.int32))
