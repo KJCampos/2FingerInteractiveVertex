@@ -39,6 +39,18 @@ class SceneObject:
         else:
             self.physics.nudge_rotation(dx, dy)
 
+        if both_pinched:
+            a = self._snap_point(p0)
+            b = self._snap_point(p1)
+            self.preview = (a, b)
+            self.drawing = True
+        else:
+            if self.drawing and self.preview:
+                a, b = self.preview
+                if math.hypot(a[0] - b[0], a[1] - b[1]) > 4:
+                    self._commit_segment(a, b)
+            self.preview = None
+            self.drawing = False
 
 class HUDCAD:
     TOOL_LINE = 0
