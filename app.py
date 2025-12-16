@@ -324,6 +324,7 @@ def main():
 
         cv2.imshow(WINDOW_NAME, frame)
         key = cv2.waitKey(1) & 0xFF
+        sim.handle_key(key)
 
         # close with X
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
