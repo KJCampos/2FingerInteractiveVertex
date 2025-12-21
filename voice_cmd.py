@@ -1,4 +1,3 @@
-# voice_commands.py
 import json
 import os
 import queue
@@ -10,38 +9,32 @@ from vosk import Model, KaldiRecognizer
 
 
 def _resolve_model_dir(path: str) -> str:
+    """Resolve the real VOSK model directory.
+
+    Rules:
+    - If the folder contains a single subfolder that itself has am/, use the subfolder.
+    - Otherwise, use the folder directly.
     """
-    Handles the common case:
-      models/vosk-model-small-en-us-0.15/vosk-model-small-en-us-0.15/...
-    """
-    path = os.path.abspath(path)
-    if os.path.isdir(path) and os.path.isfile(os.path.join(path, "am", "final.mdl")):
-        return path
-    # if a single subfolder contains the real model, pick it
-    if os.path.isdir(path):
-        subs = [os.path.join(path, d) for d in os.listdir(path)]
-        for s in subs:
-            if os.path.isdir(s) and os.path.isfile(os.path.join(s, "am", "final.mdl")):
-                return s
-    return path
+    base = os.path.abspath(path)
+    if not os.path.isdir(base):
+        return base
+
+    entries = [d for d in os.listdir(base) if not d.startswith('.')]
+    if len(entries) == 1:
+        candidate = os.path.join(base, entries[0])
+        if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "am")):
+            return candidate
+
+    if os.path.isdir(os.path.join(base, "am")):
+        return base
+
+    return base
 
 
 class VoiceCommands:
-    """
-    Wake word gating:
-      - Say "robin" to arm for a short window
-      - Then say ONE command word/phrase
-      - Emits the command text via pop_command()
+    """Wake-word gated commands using VOSK."""
 
-    Commands emitted are plain strings like:
-      "clear", "line", "curve", "wire", "glow", "snap on", "snap off", ...
-    """
-
-    def __init__(self,
-                 model_path="models/vosk-model-small-en-us-0.15",
-                 sample_rate=16000,
-                 wake_word="robin",
-                 arm_seconds=2.0):
+    def __init__(self, model_path="models/vosk-model-small-en-us-0.15", sample_rate=16000, wake_word="robin", arm_seconds=2.0):
         self.model_path = _resolve_model_dir(model_path)
         self.sample_rate = int(sample_rate)
         self.wake_word = (wake_word or "robin").strip().lower()
@@ -52,16 +45,14 @@ class VoiceCommands:
 
         self.model = Model(self.model_path)
 
-        # grammar improves latency + accuracy for small command sets
         self._cmd_phrases = [
             self.wake_word,
-            "clear", "reset",
-            "line", "curve",
-            "wire", "glow", "holo", "debug",
-            "snap on", "snap off",
-            "axis on", "axis off",
-            "grid on", "grid off",
-            "mode",
+            "clear",
+            "clear all",
+            "delete",
+            "reset",
+            "line",
+            "curve",
         ]
         grammar = json.dumps(self._cmd_phrases)
         self.rec = KaldiRecognizer(self.model, self.sample_rate, grammar)
@@ -79,12 +70,10 @@ class VoiceCommands:
 
         def callback(indata, frames, t, status):
             if status:
-                # don’t spam
                 return
             self._audio_q.put(bytes(indata))
 
         def worker():
-            # smaller blocksize = less delay
             block = 2000  # ~125ms at 16k
             with sd.RawInputStream(
                 samplerate=self.sample_rate,
@@ -102,7 +91,6 @@ class VoiceCommands:
                         if text:
                             self._handle_text(text)
                     else:
-                        # partial results can still catch wake word faster
                         pres = json.loads(self.rec.PartialResult() or "{}")
                         ptxt = (pres.get("partial") or "").strip().lower()
                         if ptxt:
@@ -122,28 +110,35 @@ class VoiceCommands:
 
     # -------- internals --------
 
+    def _arm(self):
+        self._armed_until = time.time() + self.arm_seconds
+
     def _handle_text(self, text: str, partial: bool = False):
+        text = text.strip().lower()
         now = time.time()
 
-        # If wake word is present anywhere, arm immediately.
-        if self.wake_word in text.split():
-            self._armed_until = now + self.arm_seconds
+        # Wake word handling (supports "robin clear" as one phrase)
+        if self.wake_word in text.split() or text.startswith(self.wake_word + " "):
+            self._arm()
+            if text != self.wake_word:
+                remaining = text.replace(self.wake_word, "", 1).strip()
+                if remaining:
+                    self._handle_command(remaining)
             return
 
-        # If not armed, ignore everything else.
         if now > self._armed_until:
             return
 
-        # If partial, don’t emit commands (prevents duplicates/jitter)
         if partial:
             return
 
-        # Find a matching command phrase
+        self._handle_command(text)
+
+    def _handle_command(self, text: str):
         for phrase in self._cmd_phrases:
             if phrase == self.wake_word:
                 continue
-            # exact phrase match or contained phrase
-            if phrase in text:
+            if phrase == text or phrase in text:
                 self._cmd_q.put(phrase)
-                self._armed_until = 0.0  # disarm after 1 command
+                self._armed_until = 0.0
                 return
