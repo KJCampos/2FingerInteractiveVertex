@@ -67,4 +67,5 @@ class Renderer3D:
             blur = cv2.GaussianBlur(img, (0, 0), 3)
             img = cv2.addWeighted(img, 0.8, blur, 0.3, 0)
 
+        cv2.rectangle(img, (6, 6), (self.width - 6, self.height - 6), (90, 140, 160), 1, cv2.LINE_AA)
         return img, centers

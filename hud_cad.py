@@ -39,6 +39,18 @@ class SceneObject:
         else:
             self.physics.nudge_rotation(dx, dy)
 
+        if both_pinched:
+            a = self._snap_point(p0)
+            b = self._snap_point(p1)
+            self.preview = (a, b)
+            self.drawing = True
+        else:
+            if self.drawing and self.preview:
+                a, b = self.preview
+                if math.hypot(a[0] - b[0], a[1] - b[1]) > 4:
+                    self._commit_segment(a, b)
+            self.preview = None
+            self.drawing = False
 
 class HUDCAD:
     TOOL_LINE = 0
@@ -79,8 +91,6 @@ class HUDCAD:
         self._rot_smooth = np.zeros(2, dtype=np.float32)
 
         self._ui_time = 0.0
-        self._pinching = False
-        self._pinch_hold = 0.0
 
     # ---------- input / update ----------
     def update(self, pos_uv, vel_uv, pinch, active, w, h, dt: float = 1 / 60.0):
@@ -89,7 +99,6 @@ class HUDCAD:
         scale = max(0.85, min(1.6, min(W, H) / 720.0))
         self.snap_px = int(18 * scale)
         self.close_px = int(20 * scale)
-        self._min_seg_px = max(10, int(self.snap_px * 0.7))
 
         p0 = (int(pos_uv[0][0] * W), int(pos_uv[0][1] * H))
         p1 = (int(pos_uv[1][0] * W), int(pos_uv[1][1] * H))
@@ -120,23 +129,17 @@ class HUDCAD:
             self._last_finger = p0
 
         if both_pinched:
-            self._pinch_hold += dt
             a = self._snap_point(p0)
             b = self._snap_point(p1)
-            if self._pinch_hold > 0.04:
-                if math.hypot(a[0] - b[0], a[1] - b[1]) >= self._min_seg_px * 0.5:
-                    self.preview = (a, b)
-                    self.drawing = True
-            self._pinching = True
+            self.preview = (a, b)
+            self.drawing = True
         else:
             if self.drawing and self.preview:
                 a, b = self.preview
-                if math.hypot(a[0] - b[0], a[1] - b[1]) >= self._min_seg_px:
+                if math.hypot(a[0] - b[0], a[1] - b[1]) > 4:
                     self._commit_segment(a, b)
             self.preview = None
             self.drawing = False
-            self._pinching = False
-            self._pinch_hold = 0.0
 
         # Hover + pinch selection
         if pin0 > self.pinch_on and not both_pinched and self.objects:
@@ -249,12 +252,6 @@ class HUDCAD:
         self.preview = None
         self.drawing = False
         self.prev_both = False
-        self._pinching = False
-        self._pinch_hold = 0.0
-
-    def wave_clear(self):
-        """External gesture hook to clear overlays only."""
-        self.clear_strokes()
 
     # ---------- internals ----------
     def _apply_rotation(self, oid: int, dx: float, dy: float, inertial: bool):

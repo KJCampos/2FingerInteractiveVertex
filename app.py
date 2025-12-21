@@ -231,7 +231,6 @@ def main():
 
     prev = time.time()
     fps_smooth = 0.0
-    wave_detector = WaveDetector()
 
     print("\n" + "="*60)
     print("🚀 STARK TABLE HOLOGRAPHIC CAD SYSTEM")
@@ -283,7 +282,6 @@ def main():
         pinch = [0.0, 0.0]
         pos_uv = [(0.5, 0.5), (0.5, 0.5)]
         vel_uv = [(0.0, 0.0), (0.0, 0.0)]
-        primary_lms = None
 
         if len(hands) >= 2:
             for hid in range(2):
@@ -302,15 +300,8 @@ def main():
                 uv0, _ = _tip_uv(lms, 8, W, H)
                 active = [1, 0]
                 pinch0 = _pinch_from_lms(lms, W, H)
-                pinch = [pinch0, 0.0]
-                pos_uv = [uv0, pos_uv[1]]
-        else:
-            wave_detector.history.clear()
-
-        if primary_lms is not None:
-            if wave_detector.update(primary_lms, W, H, pinch[0], now):
-                print("🌀 Wave detected -> clearing overlay")
-                hud.wave_clear()
+                pinch = [pinch0, pinch0]
+                pos_uv = [uv0, uv1]
 
         pos_uv_send = []
         vel_uv_send = []
