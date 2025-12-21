@@ -3,6 +3,7 @@ import time
 import importlib
 import cv2
 import os
+from collections import deque
 
 from hud_cad import HUDCAD
 from predictor import AlphaBetaPredictor
@@ -140,6 +141,75 @@ def _pinch_from_lms(lms, w, h):
     return float(max(0.0, min(1.0, pinch)))
 
 
+class WaveDetector:
+    """Detect a left-right wave with an open hand to clear the overlay."""
+
+    def __init__(self):
+        self.history = deque()
+        self.cooldown = 1.0
+        self.last_trigger = 0.0
+
+    def update(self, lms, w, h, pinch: float, t_now: float) -> bool:
+        if lms is None:
+            self.history.clear()
+            return False
+
+        # Only listen when not pinching (open hand)
+        if pinch > 0.35:
+            self.history.clear()
+            return False
+
+        def _uv(idx):
+            uv, _ = _tip_uv(lms, idx, w, h)
+            return uv
+
+        tips = [_uv(i) for i in (4, 8, 12, 16, 20)]
+        xs = [u for u, _ in tips]
+        ys = [v for _, v in tips]
+
+        # Require fingers to be reasonably spread (open hand)
+        spread_x = max(xs) - min(xs)
+        spread_y = max(ys) - min(ys)
+        if spread_x < 0.12 or spread_y < 0.08:
+            self.history.clear()
+            return False
+
+        # Palm center approximation using fingertips
+        cx = sum(xs) / len(xs)
+        self.history.append((t_now, cx))
+
+        # Keep ~1.2s of history
+        while self.history and (t_now - self.history[0][0] > 1.2):
+            self.history.popleft()
+
+        if len(self.history) < 5 or (t_now - self.last_trigger) < self.cooldown:
+            return False
+
+        xs_hist = [p[1] for p in self.history]
+        range_x = max(xs_hist) - min(xs_hist)
+        if range_x < 0.20:
+            return False
+
+        # Count direction changes with meaningful motion
+        changes = 0
+        last_sign = 0
+        for i in range(1, len(xs_hist)):
+            dx = xs_hist[i] - xs_hist[i - 1]
+            if abs(dx) < 0.01:
+                continue
+            sign = 1 if dx > 0 else -1
+            if last_sign != 0 and sign != last_sign:
+                changes += 1
+            last_sign = sign
+
+        if changes >= 2:
+            self.last_trigger = t_now
+            self.history.clear()
+            return True
+
+        return False
+
+
 def main():
     cap = open_camera()
     tracker = _pick_hand_tracker()
@@ -222,12 +292,13 @@ def main():
                 active[hid] = 1
                 pinch[hid] = _pinch_from_lms(lms, W, H)
                 pos_uv[hid] = uv
+            primary_lms = _get_landmarks_px(hands[0])
         elif len(hands) == 1:
             lms = _get_landmarks_px(hands[0])
             if lms is not None:
+                primary_lms = lms
                 uv0, _ = _tip_uv(lms, 8, W, H)
-                uv1, _ = _tip_uv(lms, 4, W, H)
-                active = [1, 1]
+                active = [1, 0]
                 pinch0 = _pinch_from_lms(lms, W, H)
                 pinch = [pinch0, pinch0]
                 pos_uv = [uv0, uv1]
